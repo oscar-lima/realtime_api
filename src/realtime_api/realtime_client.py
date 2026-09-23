@@ -302,8 +302,10 @@ class RealtimeClient:
         self.send({"type": "conversation.item.truncate", "item_id": item_id,
                    "content_index": 0, "audio_end_ms": int(max(0, audio_end_ms))})
 
-    def cancel_response(self) -> None:
-        self.send({"type": "response.cancel"})
+    def cancel_response(self, response_id: str = "") -> None:
+        """Cancel ``response_id``, or whichever response is in progress."""
+        self.send({"type": "response.cancel", "response_id": response_id} if response_id
+                  else {"type": "response.cancel"})
 
     def send_function_output(self, call_id: str, output: Any, respond: bool = True) -> None:
         self.send({

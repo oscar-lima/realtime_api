@@ -164,3 +164,21 @@ def test_benign_server_errors_do_not_count_as_failures():
     assert client.last_error is None
     client._dispatch({"type": "error", "error": {"code": "insufficient_quota", "message": "x"}})
     assert client.last_error["code"] == "insufficient_quota"
+
+
+def test_speak_only_says_out_of_band_and_mutes_unrequested_answers():
+    client = make_client()
+    engine = FakeEngine()
+    session = VoiceSession(client, engine, speak_only=True)
+    session.say("I picked the coke.")
+    request = client._ws.sent[-1]["response"]
+    assert request["conversation"] == "none" and request["metadata"] == {"source": "say"}
+    assert "I picked the coke." in request["instructions"]
+    client._dispatch({"type": "response.created", "response": {"id": "r1", "metadata": {"source": "say"}}})
+    client._dispatch({"type": "response.done", "response": {"id": "r1", "output": []}})
+    # an answer nobody asked for (e.g. to what the person said) is cancelled and never played
+    client._dispatch({"type": "response.created", "response": {"id": "r2", "metadata": None}})
+    assert client._ws.sent[-1]["type"] == "response.cancel" and client._ws.sent[-1]["response_id"] == "r2"
+    client._dispatch({"type": "response.output_audio.delta", "response_id": "r2", "item_id": "item_9",
+                      "delta": base64.b64encode(np.ones(10, dtype=np.int16).tobytes()).decode()})
+    assert engine.queued == []

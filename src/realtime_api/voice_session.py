@@ -65,7 +65,12 @@ class VoiceSession:
         on_assistant_delta: Optional[TextCallback] = None,
         on_tool_call: Optional[ToolCall] = None,
         send_chunk_ms: int = 40,
+        speak_only: bool = False,
     ) -> None:
+        """``speak_only``: the model never answers on its own; ``say`` runs out of
+        band (without the conversation, so it cannot drift into replying to
+        what the person said) and any response it did not request is
+        cancelled and muted."""
         self.client = client
         self.engine = engine
         self.on_user_text = on_user_text
@@ -80,6 +85,10 @@ class VoiceSession:
         self.interruptions = 0
         self._interrupted: "set[str]" = set()  # items whose remaining audio must not play
         self._say_queue: "collections.deque[str]" = collections.deque()
+        self.speak_only = speak_only
+        self._rejected: "set[str]" = set()  # responses nobody asked for (speak_only)
+        # speak_only: the person's language; say() translates into it when needed
+        self.language = "English"
 
         client.on("response.created", self._on_response_created)
         client.on("response.output_audio.delta", self._on_audio_delta)
@@ -111,6 +120,14 @@ class VoiceSession:
 
     def _on_response_created(self, event: Dict[str, Any]) -> None:
         self.response_active = True
+        response = event.get("response", {})
+        if self.speak_only and (response.get("metadata") or {}).get("source") != "say":
+            self._rejected.add(response.get("id", ""))
+            self.client.cancel_response(response.get("id", ""))  # not the sentence being said
+            _LOG.info("cancelled a response nobody asked for")
+
+    def _muted(self, event: Dict[str, Any]) -> bool:
+        return event.get("response_id", "") in self._rejected or event.get("item_id", "") in self._interrupted
 
     # ------------------------------------------------------------ robot side
 
@@ -143,6 +160,18 @@ class VoiceSession:
                 return
             text = self._say_queue.popleft()
             self.response_active = True  # until response.created/done arrive
+        if self.speak_only:
+            self.client.send({
+                "type": "response.create",
+                "response": {
+                    "conversation": "none",
+                    "input": [],
+                    "metadata": {"source": "say"},
+                    "instructions": self._say_instructions(text),
+                    "tool_choice": "none",
+                },
+            })
+            return
         self.client.send({
             "type": "response.create",
             "response": {
@@ -152,17 +181,25 @@ class VoiceSession:
             },
         })
 
+    def _say_instructions(self, text: str) -> str:
+        if self.language == "English":
+            return ("Read the following text aloud exactly as written, in the first person, "
+                    "without adding, removing or commenting on anything:\n" + text)
+        return (f"Speak {self.language}. Say the following text aloud in {self.language}, in the first person: "
+                f"parts already in {self.language} exactly as written, anything else translated faithfully into "
+                f"{self.language}, keeping names and numbers. Do not add, remove or comment on anything:\n" + text)
+
     def _on_audio_delta(self, event: Dict[str, Any]) -> None:
         # deltas of an interrupted answer can still be in flight: drop them
-        if self.engine is not None and event.get("item_id", "") not in self._interrupted:
+        if self.engine is not None and not self._muted(event):
             self.engine.play(RealtimeClient.decode_audio(event), API_RATE, event.get("item_id", ""))
 
     def _on_transcript_delta(self, event: Dict[str, Any]) -> None:
-        if self.on_assistant_delta:
+        if self.on_assistant_delta and not self._muted(event):
             self.on_assistant_delta(event.get("delta", ""))
 
     def _on_transcript_done(self, event: Dict[str, Any]) -> None:
-        if self.on_assistant_text:
+        if self.on_assistant_text and not self._muted(event):
             self.on_assistant_text(event.get("transcript", ""))
 
     def _on_text_done(self, event: Dict[str, Any]) -> None:
@@ -183,7 +220,8 @@ class VoiceSession:
             self._interrupted.add(item)
         if item and item != "calibration":
             played = self.engine.playback.played_ms(item)
-            self.client.truncate(item, played)
+            if not self.speak_only:  # out-of-band items are not in the conversation
+                self.client.truncate(item, played)
             _LOG.info("barge-in: stopped robot speech after %d ms", played)
 
     def _on_response_done(self, event: Dict[str, Any]) -> None:

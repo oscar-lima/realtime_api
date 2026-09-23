@@ -29,7 +29,7 @@ def add_api_args(p: argparse.ArgumentParser) -> None:
     api.add_argument("--api-key", default="", help="default $LITELLM_API_KEY / $OPENAI_API_KEY or key files")
     api.add_argument("--voice", default=os.environ.get("REALTIME_VOICE", "cedar"), choices=VOICES,
                      help="robot voice: cedar (default) or echo")
-    api.add_argument("--language", default="en",
+    api.add_argument("--language", default="",
                      help="language hint for the user transcript ('' = auto-detect)")
     api.add_argument("--vad", choices=["semantic_vad", "server_vad"], default="semantic_vad")
     api.add_argument("--vad-eagerness", choices=["low", "medium", "high", "auto"], default="low",

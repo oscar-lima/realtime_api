@@ -141,11 +141,26 @@ waits up to 30 s for it.
 
 Two modes (`--mode`, or `REALTIME_MODE`):
 
-- **bridge** (default): a pure speech bridge. Every recognized utterance goes
-  verbatim to `/recognized_speech`, unfiltered, and the mobipick_gpt router,
-  chatbot and planner decide what to do and what to say. The realtime model
-  never replies on its own (`create_response: false`); it only speaks
-  `/speak` and `/realtime/say`. Transcription uses `gpt-4o-transcribe` with a
+- **bridge** (default): a pure speech bridge. For a command (an utterance
+  with an action verb: pick, place, bring, go, ...) the robot asks back "Did
+  you say: pick the coke?"; after a yes it goes verbatim to
+  `/recognized_speech`, and the mobipick_gpt router, chatbot and planner
+  decide what to do and what to say. A no drops it, "no, pick the sugar box"
+  asks about the correction, and an unanswered question lapses after 20 s.
+  Chat, questions and answers ("who built you?", "table 2", "yes") and
+  "stop" or "cancel" go out at once. The language follows the person: the
+  transcription detects it (`--language` pins one), and the robot says every
+  sentence in the language the person last spoke, translating the agents'
+  English when needed. English, Spanish and German are supported and can be
+  mixed freely: commands are recognized by their verbs in all three
+  (pick/coge/nimm, ...), the question comes as "Did you say", "¿Dijiste" or
+  "Hast du gesagt", and yes/sí/ja or no/nein answer it. The confirmation keeps words that the
+  transcription invents from fan or room noise away from the robot;
+  `--no-confirm` (or `REALTIME_CONFIRM=0`) passes utterances on directly.
+  The realtime model never replies on its own (`create_response: false`, and
+  any response the agent did not request is cancelled); it only speaks
+  `/speak` and `/realtime/say`, out of band so it cannot drift into answering
+  the person. Transcription uses `gpt-4o-transcribe` with a
   hint listing the robot's objects and places (`--transcription-model`).
 - **agent**: the realtime model is Mobipick's persona
   (`mobipick_gpt/config/prompts/realtime_voice.txt`, with the static facts of
@@ -157,7 +172,8 @@ In both modes, while an order runs every utterance also reaches that order as
 an event: mobipick_api buffers `/recognized_speech`, and the planner reads it
 with `check_for_events()` (a "cancel", "stop" or new information) or takes it
 as the answer to its question in `listen()`. Noise transcribed as filler or
-non-Latin text is dropped. Turn detection is semantic VAD with `low`
+non-Latin text, a leaked transcription hint and the robot's own recent
+sentences are dropped. Turn detection is semantic VAD with `low`
 eagerness, which waits for complete sentences.
 
 ## Standalone demo
@@ -202,7 +218,7 @@ Useful flags (demo and voice agent):
 - `--vad semantic_vad|server_vad` and `--vad-eagerness low|medium|high|auto`
 - `--model gpt-realtime-2.1` for the full model (default `gpt-realtime-2.1-mini`)
 - `--backend openai` to skip LiteLLM
-- `--language ''` to auto-detect the transcript language (default `en`)
+- `--language en` pins the transcript language (default: auto-detect, so the person can switch)
 - `--debug-dir DIR` saves `mic.wav`, `reference.wav`, `aec_out.wav` and
   `sent.wav` on exit. `sent.wav` is exactly what the API heard.
 - `--meter` prints mic, AEC and reference levels, ERLE, gate state and the

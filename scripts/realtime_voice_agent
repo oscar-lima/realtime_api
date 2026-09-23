@@ -6,11 +6,14 @@ recognition + TTS. Everything the agents say on /speak (and anything
 published on /realtime/say) is spoken verbatim in the realtime voice, with
 the robot's own voice cancelled from the microphone. Two modes:
 
-  bridge (default)  a pure speech bridge: every recognized utterance goes
-                    verbatim to /recognized_speech, unfiltered, and the
-                    mobipick_gpt router, chatbot and planner decide what to
-                    do and what to answer. The realtime model never replies
-                    on its own; it only speaks /speak.
+  bridge (default)  a pure speech bridge: the robot asks back "Did you say
+                    ...?" and on a yes the utterance goes verbatim to
+                    /recognized_speech, where the mobipick_gpt router,
+                    chatbot and planner decide what to do and what to
+                    answer. "stop" and "cancel" go out at once. The confirmation
+                    keeps words the transcription invents from noise away
+                    from the robot (--no-confirm skips it). The realtime
+                    model never replies on its own; it only speaks /speak.
   agent             the realtime model is Mobipick's persona
                     (mobipick_gpt/config/prompts/realtime_voice.txt): it
                     answers small talk itself and calls "execute" for orders
@@ -86,18 +89,112 @@ BRIDGE_INSTRUCTIONS = (
 
 # Steers the transcription towards the robot's world (known objects and places).
 TRANSCRIPTION_HINT = (
-    "Mobipick robot commands. Objects: coke, sugar box, relay, screwdriver, multimeter, power drill, "
+    "Mobipick robot commands, spoken in English, Spanish or German. Objects: coke, sugar box, relay, screwdriver, multimeter, power drill, "
     "hot glue gun, blue box, klt, bleach, mustard, soup, meat. Places: table 1, table 2, table 3. "
     "Words: pick, place, insert, bring, navigate, inspect, perceive, cancel, stop."
 )
 
 FILLER = {"mm", "mhm", "hm", "hmm", "uh", "um", "ah", "eh", "oh", "uh-huh", "mm-hmm"}
+# English, Spanish and German, so the person can switch language mid session
+STOP_WORDS = {"stop", "cancel", "abort", "halt", "freeze", "para", "alto", "detente", "cancela", "cancelar",
+              "stopp", "abbrechen", "anhalten", "aufhören"}
+YES_WORDS = {"yes", "yeah", "yep", "yup", "correct", "right", "exactly", "sure", "affirmative", "ok", "okay",
+             "confirm", "confirmed", "indeed", "go", "do", "please", "that", "is", "it", "that's", "ahead",
+             "sí", "si", "claro", "correcto", "vale", "exacto", "eso", "es", "por", "favor", "dale",
+             "ja", "genau", "richtig", "stimmt", "bitte", "klar"}
+SURE_YES = {"yes", "yeah", "yep", "yup", "correct", "exactly", "affirmative", "sí", "si", "claro", "correcto",
+            "exacto", "ja", "genau", "richtig"}
+NO_WORDS = {"no", "nope", "nah", "wrong", "negative", "incorrect", "not", "nein", "falsch", "incorrecto"}
+# an utterance with one of these verbs (in its own language) asks the robot to act, so it is confirmed first
+ACTION_WORDS = {
+    "en": {"pick", "place", "put", "insert", "bring", "take", "grab", "fetch", "carry", "transport", "deliver",
+           "move", "go", "drive", "navigate", "come", "return", "turn", "perceive", "inspect", "look", "find",
+           "search", "explore", "scan", "check", "open", "close", "drop", "release", "hand", "give", "push",
+           "pull", "lift", "store", "clean", "sort", "stack"},
+    "es": {"coge", "recoge", "agarra", "toma", "trae", "lleva", "pon", "coloca", "mete", "inserta", "ve",
+           "vete", "ir", "navega", "muévete", "mueve", "busca", "mira", "inspecciona", "revisa", "explora",
+           "deja", "suelta", "abre", "cierra", "entrega", "dame", "transporta", "percibe"},
+    "de": {"nimm", "hol", "bring", "bringe", "stell", "leg", "steck", "fahr", "fahre", "geh", "gehe",
+           "such", "suche", "schau", "prüf", "prüfe", "öffne", "schließ", "gib", "transportiere"},
+}
+# a few very common words per language, to tell which one the person speaks
+LANGUAGE_WORDS = {
+    "en": {"the", "a", "and", "is", "to", "of", "you", "i", "it", "what", "please", "table", "can", "do", "on",
+           "in", "my", "your", "this", "that", "are", "with", "from", "where", "who", "how"},
+    "es": {"el", "la", "los", "las", "de", "del", "que", "y", "en", "es", "un", "una", "por", "con", "mesa",
+           "qué", "cómo", "dónde", "quién", "hola", "quiero", "puedes", "al", "lo", "me", "mí", "te", "tu",
+           "español", "hablar", "hablamos", "sí", "pero", "muy", "está"},
+    "de": {"der", "die", "das", "und", "ist", "nicht", "ich", "du", "bitte", "zum", "zur", "den", "dem", "ein",
+           "eine", "mit", "auf", "tisch", "hallo", "wir", "sprechen", "deutsch", "kannst", "wo", "wer", "was"},
+}
+LANGUAGE_NAMES = {"en": "English", "es": "Spanish", "de": "German"}
+# the bridge's own sentences, per language (its words, not the person's)
+PHRASES = {
+    "en": {"confirm": "Did you say: {}?", "yes": "Okay.", "no": "Okay, I ignore it."},
+    "es": {"confirm": "¿Dijiste: {}?", "yes": "Vale.", "no": "Vale, lo ignoro."},
+    "de": {"confirm": "Hast du gesagt: {}?", "yes": "Okay.", "no": "Okay, ich ignoriere es."},
+}
+CONFIRM_TIMEOUT_S = 20.0
+
+
+def words_of(text: str) -> "list[str]":
+    return [w.lower() for w in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9']+", text)]
 
 
 def is_speech(text: str) -> bool:
-    """Words worth passing on as an event, not noise transcribed as filler or a stray script."""
-    words = re.findall(r"[A-Za-zÄÖÜäöüß']+", text)
+    """Words worth passing on, not noise transcribed as filler or a stray script."""
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']+", text)
     return bool(words) and not all(w.lower() in FILLER for w in words)
+
+
+def overlaps(text: str, reference: str, share: float = 0.7, min_words: int = 3) -> bool:
+    """Most words of ``text`` come from ``reference`` (a leaked prompt or the robot's own voice)."""
+    words = words_of(text)
+    ref = set(words_of(reference))
+    return len(words) >= min_words and sum(w in ref for w in words) >= share * len(words)
+
+
+def detect_language(text: str, current: str = "en") -> str:
+    """'en', 'es' or 'de' by common words; ``current`` when the words do not tell."""
+    words = words_of(text)
+    scores = {lang: sum(w in common or w in ACTION_WORDS[lang] for w in words)
+              for lang, common in LANGUAGE_WORDS.items()}
+    if re.search(r"[ñ¿¡áéíóú]", text):
+        scores["es"] += 2
+    if re.search(r"[äöüß]", text):
+        scores["de"] += 2
+    best = max(scores, key=scores.get)
+    if scores[best] >= 2 and list(scores.values()).count(scores[best]) == 1:
+        return best
+    return current
+
+
+def is_command(text: str, language: str = "en") -> bool:
+    """An order for the robot, as opposed to chat, a question about it or an answer.
+
+    Verbs of every language count, except English ones inside a Spanish or
+    German utterance: a Spanish sentence with a misheard "pick" is not an order.
+    """
+    verbs = set().union(*(v for lang, v in ACTION_WORDS.items() if lang != "en" or language == "en"))
+    return any(w in verbs for w in words_of(text))
+
+
+def is_stop(text: str) -> bool:
+    words = words_of(text)
+    # first or last word only: "para" is also Spanish for "for"
+    return 0 < len(words) <= 4 and (words[0] in STOP_WORDS or words[-1] in STOP_WORDS)
+
+
+def yes_or_no(text: str) -> "tuple[str, str]":
+    """('yes' | 'no' | '', rest): a short yes, a no with an optional correction, or neither."""
+    words = words_of(text)
+    if words and words[0] in NO_WORDS:
+        rest = re.sub(r"^\W*(no+|nope|nah|wrong|negative|incorrect|not|nein|falsch|incorrecto)\b[\s,.!-]*", "",
+                      text.strip(), flags=re.I)
+        return "no", rest
+    if words and (words[0] in SURE_YES or len(words) <= 4 and all(w in YES_WORDS for w in words)):
+        return "yes", ""
+    return "", text
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,6 +211,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["bridge", "agent"], default=os.environ.get("REALTIME_MODE", "bridge"),
                    help="bridge: pass every utterance to mobipick_gpt unfiltered (default); agent: the realtime "
                         "model answers small talk itself and decides what to execute")
+    p.add_argument("--no-confirm", action="store_true", default=os.environ.get("REALTIME_CONFIRM", "1") == "0",
+                   help="bridge mode: pass utterances on without asking 'Did you say ...?' first")
     ros.add_argument("--prompt-dir", default=os.environ.get("MOBIPICK_PROMPT_DIR", DEFAULT_PROMPT_DIR))
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
@@ -143,12 +242,18 @@ class VoiceAgent:
         self._speaking = False
         self._line_open = False
         self._busy = False
+        self._pending = ""       # utterance waiting for the person's yes
+        self._pending_at = 0.0
+        self._said: "list[tuple[float, str]]" = []  # the robot's own recent words, to drop their echo
+        self._played_until = 0.0  # when the robot voice last stopped
+        self.language = "en"      # the language the person speaks now
         self.voice = VoiceSession(
             self.client, self.engine,
             on_user_text=self._on_user_text,
             on_assistant_delta=self._on_robot_delta,
             on_assistant_text=self._on_robot_text,
             on_tool_call=self._on_tool_call,
+            speak_only=self.bridge,
         )
         self.stop = threading.Event()
         self.client.on("connection.closed", lambda e: self.stop.set())
@@ -160,15 +265,75 @@ class VoiceAgent:
             return
         self._print(f"you>   {text}")
         self.ros.publish("/realtime/user_transcript", text)
-        if (self.bridge or self._busy) and is_speech(text):
-            # Bridge mode: every utterance is a request for mobipick_gpt.
-            # While an order runs (both modes) it is an event for that order:
-            # mobipick_api's HRI buffers /recognized_speech, the planner reads it
-            # with check_for_events() ("cancel", "stop", new information) and
-            # listen() takes it as the answer to a question; the runner starts
-            # no new workflow then.
-            self._print(f"  -> {'event' if self._busy else 'request'}: {text}")
-            self.ros.publish(self.args.goal_topic, text)
+        if not is_speech(text):
+            return
+        if overlaps(text, TRANSCRIPTION_HINT, share=0.8, min_words=6):
+            self._print("  x  ignored: the transcription hint leaked in")
+            return
+        # a leak of the robot voice arrives while it plays or right after
+        leak_window = self._speaking or time.monotonic() - self._played_until < 2.0
+        if leak_window and any(overlaps(text, said, share=0.8) for _, said in self._said):
+            self._print("  x  ignored: my own voice")
+            return
+        language = detect_language(text, self.language)
+        if language != self.language:
+            self._print(f"  ~  language: {LANGUAGE_NAMES[language]}")
+            self.language = language
+            self.voice.language = LANGUAGE_NAMES[language]
+        if self.bridge and not self.args.no_confirm:
+            self._confirm(text)
+            return
+        if self.bridge or self._busy:
+            self._pass_on(text)
+
+    def _confirm(self, text: str) -> None:
+        """Ask "Did you say ...?" before a command and pass it on only after a yes.
+
+        Chat, questions and answers (no action verb) go straight through, as
+        does "stop"; ghost words from noise mostly look like commands
+        ("pick", "place"), which is what the confirmation guards against.
+        """
+        if is_stop(text):
+            self._pending = ""
+            self._pass_on(text)
+            return
+        pending = self._pending if time.monotonic() - self._pending_at < CONFIRM_TIMEOUT_S else ""
+        if self._pending and not pending:
+            self._print(f"  x  dropped unconfirmed: {self._pending}")
+        self._pending = ""
+        verdict, rest = yes_or_no(text) if pending else ("", text)
+        if verdict == "yes":
+            self._pass_on(pending)
+            self._say_self(PHRASES[self.language]["yes"])
+            return
+        if verdict == "no":
+            self._print(f"  x  rejected: {pending}")
+            if len(words_of(rest)) < 2 or not is_speech(rest):
+                self._say_self(PHRASES[self.language]["no"])
+                return
+            text = rest  # "no, pick the sugar box": confirm the correction
+        if not is_command(text, self.language):
+            self._pending, self._pending_at = pending, self._pending_at  # a question does not cancel it
+            self._pass_on(text)
+            return
+        self._pending, self._pending_at = text, time.monotonic()
+        self._print(f"  ?  confirm: {text}")
+        phrase = PHRASES[self.language]["confirm"]
+        self._say_self(phrase.format(text), own=phrase.format(""))
+
+    def _pass_on(self, text: str) -> None:
+        # Idle: a request that starts a workflow. While an order runs: an
+        # event for it (mobipick_api's HRI buffers /recognized_speech, the
+        # planner reads it with check_for_events() and listen() takes it as
+        # an answer; the runner starts no new workflow then).
+        self._print(f"  -> {'event' if self._busy else 'request'}: {text}")
+        self.ros.publish(self.args.goal_topic, text)
+
+    def _say_self(self, text: str, own: str = "") -> None:
+        """Say ``text``; ``own`` is the part that is the robot's own words (the rest quotes the person)."""
+        now = time.monotonic()
+        self._said = [(t, s) for t, s in self._said if now - t < 60] + [(now, own or text)]
+        self.voice.say(text)
 
     def _on_tool_call(self, name: str, arguments: dict) -> dict:
         request = str(arguments.get("request", "")).strip()
@@ -187,6 +352,8 @@ class VoiceAgent:
     def _on_busy(self, busy: bool) -> None:
         if busy != self._busy:
             self._busy = busy
+            if self.bridge:
+                return
             self.voice.note("[status] " + ("I started working on an order; until it is finished everything "
                                            "the person says reaches it directly as an event" if busy else
                                            "I finished my order and can take new orders"))
@@ -198,8 +365,9 @@ class VoiceAgent:
         if not text:
             return
         self._print(f"  <- planner says: {text}")
-        self.voice.note(f"[I said] {text}")
-        self.voice.say(text)
+        if not self.bridge:
+            self.voice.note(f"[I said] {text}")
+        self._say_self(text)
 
     def _on_debug(self, raw: str) -> None:
         try:
@@ -210,7 +378,8 @@ class VoiceAgent:
             text = str(data.get("text", "")).strip()
             if text:
                 _LOG.info("robot status: %s", text)
-                self.voice.note(f"[status] {text}")
+                if not self.bridge:
+                    self.voice.note(f"[status] {text}")
 
     def _on_robot_delta(self, delta: str) -> None:
         if not self._line_open:
@@ -236,6 +405,8 @@ class VoiceAgent:
             speaking = self.engine.is_playing()
             if speaking != self._speaking:
                 self._speaking = speaking
+                if not speaking:
+                    self._played_until = time.monotonic()
                 self.ros.publish_bool("/realtime/is_speaking", speaking)
 
     # ---------------------------------------------------------------- run
@@ -254,7 +425,7 @@ class VoiceAgent:
             start_meter(self.engine, self.stop)
         print(f"Mobipick voice agent ready (voice {self.args.voice}, echo canceller {self.engine.aec.name}). "
               f"Tasks go to {self.args.goal_topic}, {self.args.speak_topic} is spoken. Ctrl-C to quit.", flush=True)
-        self.voice.say("Hello, I am Mobipick. How can I help you?")
+        self._say_self("Hello, I am Mobipick. How can I help you?")
         self.stop.wait()
         return 0
 
