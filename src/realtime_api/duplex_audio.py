@@ -430,6 +430,7 @@ class DuplexAudioEngine:
         self._hist_ref: Deque[np.ndarray] = collections.deque(maxlen=int(self._hist_s * 100))
         self._frames_since_track = 0
         self.last_delay: Optional[Tuple[float, float]] = None
+        self._suspect_lag: Optional[float] = None
 
         # stats
         self.stats: Dict[str, float] = {"mic_db": -90.0, "out_db": -90.0, "ref_db": -90.0, "erle_db": 0.0}
@@ -618,7 +619,16 @@ class DuplexAudioEngine:
     # ------------------------------------------------------------ delay
 
     def _track_delay(self, mic: np.ndarray, ref: np.ndarray) -> None:
-        """Every ~3 s of robot speech, verify the reference leads the echo."""
+        """Every ~3 s of robot speech, verify the reference leads the echo.
+
+        Windows containing double talk (gate open: a person speaks over the
+        robot) are skipped because they give unreliable estimates, and the
+        delay only moves after two consistent, confident measurements.
+        """
+        if self.gate.is_open and self.gate.mode == "smart":
+            self._hist_mic.clear()  # restart the window after double talk
+            self._hist_ref.clear()
+            return
         self._hist_mic.append(mic)
         self._hist_ref.append(ref)
         if rms(ref) < 100.0:
@@ -632,10 +642,11 @@ class DuplexAudioEngine:
         lag, conf = estimate_delay(r, m, PROC_RATE, max_delay_s=0.5)
         lag_ms = 1000.0 * lag / PROC_RATE
         self.last_delay = (lag_ms, conf)
-        if conf < 10.0:
-            return
         lead_ms = self.ref_lead_s * 1000.0
-        if abs(lag_ms - lead_ms) > 25.0:
+        suspect = conf >= 20.0 and abs(lag_ms - lead_ms) > 25.0
+        previous, self._suspect_lag = self._suspect_lag, (lag_ms if suspect else None)
+        if suspect and previous is not None and abs(previous - lag_ms) < 5.0:
+            self._suspect_lag = None
             self._set_echo_delay(self.echo_delay_s + (lag_ms - lead_ms) / 1000.0)
             _LOG.warning(
                 "echo lags the reference by %.0f ms instead of %.0f ms (confidence %.0f); "

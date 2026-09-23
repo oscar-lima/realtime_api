@@ -156,3 +156,11 @@ def test_user_and_assistant_text_callbacks():
     client._dispatch({"type": "conversation.item.input_audio_transcription.completed", "transcript": " hello "})
     client._dispatch({"type": "response.output_audio_transcript.done", "transcript": "Hi there."})
     assert got == [("user", "hello"), ("robot", "Hi there.")]
+
+
+def test_benign_server_errors_do_not_count_as_failures():
+    client = make_client()
+    client._dispatch({"type": "error", "error": {"code": "conversation_already_has_active_response", "message": "x"}})
+    assert client.last_error is None
+    client._dispatch({"type": "error", "error": {"code": "insufficient_quota", "message": "x"}})
+    assert client.last_error["code"] == "insufficient_quota"

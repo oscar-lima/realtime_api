@@ -55,6 +55,8 @@ def parse_args() -> argparse.Namespace:
     api.add_argument("--litellm-url", default="", help="default $LITELLM_BASE_URL or http://127.0.0.1:4000/v1")
     api.add_argument("--api-key", default="", help="default $LITELLM_API_KEY / $OPENAI_API_KEY or key files")
     api.add_argument("--voice", default="marin")
+    api.add_argument("--language", default="en",
+                     help="language hint for the user transcript ('' = auto-detect)")
     api.add_argument("--vad", choices=["semantic_vad", "server_vad"], default="semantic_vad")
     api.add_argument("--vad-eagerness", choices=["low", "medium", "high", "auto"], default="auto")
     api.add_argument("--instructions-file", default="")
@@ -197,7 +199,7 @@ def run_voice(args: argparse.Namespace) -> int:
     client = RealtimeClient(url, token)
     session = build_session(load_instructions(args), voice=args.voice,
                             tools=None if args.no_tools else [ROBOT_COMMAND_TOOL],
-                            vad=args.vad, vad_eagerness=args.vad_eagerness)
+                            vad=args.vad, vad_eagerness=args.vad_eagerness, language=args.language)
     state = {"speaking": False}
 
     def assistant_delta(delta: str) -> None:
@@ -210,8 +212,14 @@ def run_voice(args: argparse.Namespace) -> int:
         state["speaking"] = False
         print(flush=True)
 
+    def user_text(text: str) -> None:
+        if text:  # may arrive while the robot's answer is still streaming
+            print(("\n" if state["speaking"] else "") + f"you>   {text}", flush=True)
+            if state["speaking"]:
+                print("robot> ...", end="", flush=True)
+
     VoiceSession(client, engine,
-                 on_user_text=lambda t: print(f"you>   {t}", flush=True) if t else None,
+                 on_user_text=user_text,
                  on_assistant_delta=assistant_delta, on_assistant_text=assistant_done,
                  on_tool_call=dry_tool)
     client.on("input_audio_buffer.speech_started", lambda e: _LOG.debug("user speech started"))

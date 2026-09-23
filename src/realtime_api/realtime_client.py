@@ -31,6 +31,8 @@ API_RATE = 24000  # the Realtime API speaks 24 kHz mono PCM16
 
 EventHandler = Callable[[Dict[str, Any]], None]
 
+_BENIGN_ERRORS = {"conversation_already_has_active_response", "response_cancel_not_active"}
+
 # GA name -> beta alias, so handlers can subscribe with GA names only
 _BETA_ALIASES = {
     "response.audio.delta": "response.output_audio.delta",
@@ -107,7 +109,8 @@ def build_session(
         audio_in: Dict[str, Any] = {
             "format": {"type": "audio/pcm", "rate": API_RATE},
             "turn_detection": turn,
-            "transcription": {"model": transcription_model, "language": language} if transcription_model else None,
+            "transcription": ({"model": transcription_model, "language": language} if language
+                              else {"model": transcription_model}) if transcription_model else None,
         }
         if noise_reduction:
             audio_in["noise_reduction"] = {"type": noise_reduction}
@@ -181,8 +184,14 @@ class RealtimeClient:
         elif etype == "session.updated":
             self.session_ready.set()
         elif etype == "error":
-            self.last_error = event.get("error", event)
-            _LOG.error("realtime error: %s", self.last_error)
+            error = event.get("error", event)
+            if error.get("code") in _BENIGN_ERRORS:
+                # e.g. server VAD saw another turn end while an answer is still
+                # streaming; the server just skips the extra response
+                _LOG.debug("realtime: %s", error.get("message"))
+            else:
+                self.last_error = error
+                _LOG.error("realtime error: %s", error)
         for handler in self._handlers.get(etype, []) + self._handlers.get("*", []):
             try:
                 handler(event)
