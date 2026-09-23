@@ -187,7 +187,10 @@ class VoiceSession:
                     "without adding, removing or commenting on anything:\n" + text)
         return (f"Speak {self.language}. Say the following text aloud in {self.language}, in the first person: "
                 f"parts already in {self.language} exactly as written, anything else translated faithfully into "
-                f"{self.language}, keeping names and numbers. Do not add, remove or comment on anything:\n" + text)
+                f"{self.language}, keeping names and numbers. You are a robot arm on a mobile base: pick means "
+                "grasp an object (Spanish agarrar or recoger, German greifen or aufnehmen), place means put down "
+                "(colocar, abstellen), insert means put into a box (meter, einlegen), perceive means look at "
+                "(percibir, erfassen), table means mesa or Tisch. Do not add, remove or comment on anything:\n" + text)
 
     def _on_audio_delta(self, event: Dict[str, Any]) -> None:
         # deltas of an interrupted answer can still be in flight: drop them

@@ -160,8 +160,13 @@ Two modes (`--mode`, or `REALTIME_MODE`):
   The realtime model never replies on its own (`create_response: false`, and
   any response the agent did not request is cancelled); it only speaks
   `/speak` and `/realtime/say`, out of band so it cannot drift into answering
-  the person. Transcription uses `gpt-4o-transcribe` with a
-  hint listing the robot's objects and places (`--transcription-model`).
+  the person. Transcription uses `gpt-4o-transcribe` (`--transcription-model`)
+  without a prompt: an English word list turned short Spanish and German
+  answers into listed objects ("sí" became "soup"). `--transcription-hint`
+  sets one. Command verbs are matched as stems, so conjugated and separable
+  forms count (agarraras, herbringen). A single word is confirmed like a
+  command unless it answers a question the agents just asked, and a stray
+  word while a confirmation is pending makes the robot ask again.
 - **agent**: the realtime model is Mobipick's persona
   (`mobipick_gpt/config/prompts/realtime_voice.txt`, with the static facts of
   `chatbot.txt` filled in by `src/realtime_api/mobipick_prompt.py`). It

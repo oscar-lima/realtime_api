@@ -87,17 +87,15 @@ BRIDGE_INSTRUCTIONS = (
     "you only read aloud, exactly as written and in a natural friendly tone, the sentences you are asked to say."
 )
 
-# Steers the transcription towards the robot's world (known objects and places).
-TRANSCRIPTION_HINT = (
-    "Mobipick robot commands, spoken in English, Spanish or German. Objects: coke, sugar box, relay, screwdriver, multimeter, power drill, "
-    "hot glue gun, blue box, klt, bleach, mustard, soup, meat. Places: table 1, table 2, table 3. "
-    "Words: pick, place, insert, bring, navigate, inspect, perceive, cancel, stop."
-)
+# Optional prompt for the transcription model (--transcription-hint). Off by default: an English
+# word list turned short Spanish and German answers into listed objects ("sí" -> "soup"), and
+# the transcription sometimes returned the hint itself for noise.
+TRANSCRIPTION_HINT = ""
 
 FILLER = {"mm", "mhm", "hm", "hmm", "uh", "um", "ah", "eh", "oh", "uh-huh", "mm-hmm"}
 # English, Spanish and German, so the person can switch language mid session
-STOP_WORDS = {"stop", "cancel", "abort", "halt", "freeze", "para", "alto", "detente", "cancela", "cancelar",
-              "stopp", "abbrechen", "anhalten", "aufhören"}
+STOP_RE = re.compile(r"^(stop\w*|cancel\w*|abort\w*|halt\w*|freeze|para|pare|paren|alto|det[eé]n\w*|stopp\w*|"
+                     r"abbrech\w*|abgebrochen|anhalten|aufh[öo]r\w*|schluss)$")
 YES_WORDS = {"yes", "yeah", "yep", "yup", "correct", "right", "exactly", "sure", "affirmative", "ok", "okay",
              "confirm", "confirmed", "indeed", "go", "do", "please", "that", "is", "it", "that's", "ahead",
              "sí", "si", "claro", "correcto", "vale", "exacto", "eso", "es", "por", "favor", "dale",
@@ -105,17 +103,32 @@ YES_WORDS = {"yes", "yeah", "yep", "yup", "correct", "right", "exactly", "sure",
 SURE_YES = {"yes", "yeah", "yep", "yup", "correct", "exactly", "affirmative", "sí", "si", "claro", "correcto",
             "exacto", "ja", "genau", "richtig"}
 NO_WORDS = {"no", "nope", "nah", "wrong", "negative", "incorrect", "not", "nein", "falsch", "incorrecto"}
-# an utterance with one of these verbs (in its own language) asks the robot to act, so it is confirmed first
-ACTION_WORDS = {
-    "en": {"pick", "place", "put", "insert", "bring", "take", "grab", "fetch", "carry", "transport", "deliver",
-           "move", "go", "drive", "navigate", "come", "return", "turn", "perceive", "inspect", "look", "find",
-           "search", "explore", "scan", "check", "open", "close", "drop", "release", "hand", "give", "push",
-           "pull", "lift", "store", "clean", "sort", "stack"},
-    "es": {"coge", "recoge", "agarra", "toma", "trae", "lleva", "pon", "coloca", "mete", "inserta", "ve",
-           "vete", "ir", "navega", "muévete", "mueve", "busca", "mira", "inspecciona", "revisa", "explora",
-           "deja", "suelta", "abre", "cierra", "entrega", "dame", "transporta", "percibe"},
-    "de": {"nimm", "hol", "bring", "bringe", "stell", "leg", "steck", "fahr", "fahre", "geh", "gehe",
-           "such", "suche", "schau", "prüf", "prüfe", "öffne", "schließ", "gib", "transportiere"},
+# an utterance with one of these verbs asks the robot to act, so it is confirmed first. Matched as
+# stems: English with its endings, Spanish in any conjugation (agarra, agarrar, agarraras), German
+# also behind a separable prefix (herbringen, abstellen, aufheben).
+ACTION_STEMS = {
+    "en": ["pick", "place", "put", "insert", "bring", "brought", "take", "took", "grab", "fetch", "carry",
+           "transport", "deliver", "move", "go", "drive", "navigate", "come", "return", "turn", "perceive",
+           "inspect", "look", "find", "search", "explore", "scan", "check", "open", "close", "drop", "release",
+           "hand", "give", "push", "pull", "lift", "store", "clean", "sort", "stack"],
+    "es": ["agarr", "cog", "coj", "recog", "recoj", "tom", "traer", "trae", "traig", "traj", "llev", "pon", "coloc",
+           "mete", "meter", "met", "insert", "naveg", "muev", "mov", "busc", "mira", "mirar", "inspeccion", "revis",
+           "explor", "dej", "suelt", "solt", "abre", "abrir", "abr", "cierr", "cerr", "entreg", "dame", "transport",
+           "percib", "ve", "vete", "ir", "vay", "ven", "sube", "baja", "levant"],
+    "de": ["greif", "nehm", "nimm", "bring", "hol", "stell", "leg", "steck", "fahr", "geh", "such", "schau",
+           "prüf", "öffn", "schließ", "gib", "transport", "heb", "trag", "komm", "navigier",
+           "inspizier", "untersuch"],
+}
+_EN_ENDINGS = r"(s|es|ed|ing|d)?"
+_DE_PREFIX = r"(her|hin|ab|auf|an|mit|zurück|weg|rein|raus|hoch|runter|ein|vorbei|hinüber|herüber)?"
+_SHORT_EXACT = {"ve", "ir", "ven", "dame", "pon", "mira", "mete", "abre", "trae", "sube", "baja", "vete", "tom",
+                "met", "abr", "cog", "coj", "mov", "hol", "leg", "geh", "gib", "heb", "go", "put"}
+ACTION_RE = {
+    "en": re.compile(r"^(" + "|".join(ACTION_STEMS["en"]) + ")" + _EN_ENDINGS + "$"),
+    "es": re.compile(r"^(" + "|".join(sorted(set(ACTION_STEMS["es"]) - _SHORT_EXACT, key=len, reverse=True))
+                     + r")\w*$|^(ve|ir|ven|dame|pon|ponla|ponlo|mira|mete|abre|trae|sube|baja|vete|toma|tomar|"
+                       r"coge|coger|cojas|mueve|mover|abrir)$"),
+    "de": re.compile(r"^" + _DE_PREFIX + "(" + "|".join(ACTION_STEMS["de"]) + r")\w*$"),
 }
 # a few very common words per language, to tell which one the person speaks
 LANGUAGE_WORDS = {
@@ -135,6 +148,7 @@ PHRASES = {
     "de": {"confirm": "Hast du gesagt: {}?", "yes": "Okay.", "no": "Okay, ich ignoriere es."},
 }
 CONFIRM_TIMEOUT_S = 20.0
+ANSWER_WINDOW_S = 40.0  # a question of the agents stays open this long for one-word answers
 
 
 def words_of(text: str) -> "list[str]":
@@ -157,7 +171,7 @@ def overlaps(text: str, reference: str, share: float = 0.7, min_words: int = 3) 
 def detect_language(text: str, current: str = "en") -> str:
     """'en', 'es' or 'de' by common words; ``current`` when the words do not tell."""
     words = words_of(text)
-    scores = {lang: sum(w in common or w in ACTION_WORDS[lang] for w in words)
+    scores = {lang: sum(w in common or bool(ACTION_RE[lang].match(w)) for w in words)
               for lang, common in LANGUAGE_WORDS.items()}
     if re.search(r"[ñ¿¡áéíóú]", text):
         scores["es"] += 2
@@ -175,14 +189,20 @@ def is_command(text: str, language: str = "en") -> bool:
     Verbs of every language count, except English ones inside a Spanish or
     German utterance: a Spanish sentence with a misheard "pick" is not an order.
     """
-    verbs = set().union(*(v for lang, v in ACTION_WORDS.items() if lang != "en" or language == "en"))
-    return any(w in verbs for w in words_of(text))
+    patterns = [r for lang, r in ACTION_RE.items() if lang != "en" or language == "en"]
+    return any(r.match(w) for w in words_of(text) for r in patterns)
 
 
 def is_stop(text: str) -> bool:
     words = words_of(text)
     # first or last word only: "para" is also Spanish for "for"
-    return 0 < len(words) <= 4 and (words[0] in STOP_WORDS or words[-1] in STOP_WORDS)
+    return 0 < len(words) <= 4 and bool(STOP_RE.match(words[0]) or STOP_RE.match(words[-1]))
+
+
+def as_command(text: str) -> str:
+    """The order as read back: without a leading "yes," and without end punctuation."""
+    text = re.sub(r"^\W*(yes|yeah|ok|okay|sí|si|vale|claro|ja|genau|also)\b[\s,.!]*", "", text.strip(), flags=re.I)
+    return re.sub(r"[\s.!?¿¡,;:]+$", "", text).strip() or text.strip()
 
 
 def yes_or_no(text: str) -> "tuple[str, str]":
@@ -193,7 +213,8 @@ def yes_or_no(text: str) -> "tuple[str, str]":
                       text.strip(), flags=re.I)
         return "no", rest
     if words and (words[0] in SURE_YES or len(words) <= 4 and all(w in YES_WORDS for w in words)):
-        return "yes", ""
+        rest = re.sub(r"^\W*\w+\b[\s,.!]*", "", text.strip()) if words[0] in SURE_YES else ""
+        return "yes", rest
     return "", text
 
 
@@ -213,6 +234,8 @@ def parse_args() -> argparse.Namespace:
                         "model answers small talk itself and decides what to execute")
     p.add_argument("--no-confirm", action="store_true", default=os.environ.get("REALTIME_CONFIRM", "1") == "0",
                    help="bridge mode: pass utterances on without asking 'Did you say ...?' first")
+    p.add_argument("--transcription-hint", default=os.environ.get("REALTIME_TRANSCRIPTION_HINT", TRANSCRIPTION_HINT),
+                   help="prompt for the transcription model, e.g. expected object names (default: none)")
     ros.add_argument("--prompt-dir", default=os.environ.get("MOBIPICK_PROMPT_DIR", DEFAULT_PROMPT_DIR))
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
@@ -238,10 +261,11 @@ class VoiceAgent:
             tools=None if (args.no_tools or self.bridge) else [MOBIPICK_TOOL],
             vad=args.vad, vad_eagerness=args.vad_eagerness, language=args.language,
             create_response=not self.bridge, transcription_model=args.transcription_model,
-            transcription_prompt=TRANSCRIPTION_HINT)
+            transcription_prompt=args.transcription_hint)
         self._speaking = False
         self._line_open = False
         self._busy = False
+        self._asked_at = 0.0     # when the agents last asked the person a question
         self._pending = ""       # utterance waiting for the person's yes
         self._pending_at = 0.0
         self._said: "list[tuple[float, str]]" = []  # the robot's own recent words, to drop their echo
@@ -267,7 +291,7 @@ class VoiceAgent:
         self.ros.publish("/realtime/user_transcript", text)
         if not is_speech(text):
             return
-        if overlaps(text, TRANSCRIPTION_HINT, share=0.8, min_words=6):
+        if self.args.transcription_hint and overlaps(text, self.args.transcription_hint, share=0.8, min_words=6):
             self._print("  x  ignored: the transcription hint leaked in")
             return
         # a leak of the robot voice arrives while it plays or right after
@@ -303,8 +327,19 @@ class VoiceAgent:
         self._pending = ""
         verdict, rest = yes_or_no(text) if pending else ("", text)
         if verdict == "yes":
-            self._pass_on(pending)
-            self._say_self(PHRASES[self.language]["yes"])
+            if len(words_of(rest)) >= 2 and is_command(rest, self.language) \
+                    and set(words_of(rest)) != set(words_of(pending)):
+                text = rest  # "yes, pick the sugar box": a new wording, confirm that instead
+            else:
+                self._pass_on(pending)
+                self._say_self(PHRASES[self.language]["yes"])
+                return
+        if pending and verdict == "" and len(words_of(text)) == 1 and not is_command(text, self.language):
+            # a lone unknown word while waiting for yes or no is mostly noise
+            # ("sí" heard as "soup"): ask again instead of passing it on
+            self._pending, self._pending_at = pending, time.monotonic()
+            self._print(f"  ?  asking again, heard only: {text}")
+            self._ask(pending)
             return
         if verdict == "no":
             self._print(f"  x  rejected: {pending}")
@@ -312,12 +347,21 @@ class VoiceAgent:
                 self._say_self(PHRASES[self.language]["no"])
                 return
             text = rest  # "no, pick the sugar box": confirm the correction
-        if not is_command(text, self.language):
+        # A lone word is an answer when the agents just asked something
+        # ("table 2", "the coke"); otherwise it is mostly noise heard as a
+        # word ("soup", "navegar") and is confirmed like a command.
+        answering = self._busy and time.monotonic() - self._asked_at < ANSWER_WINDOW_S
+        lone = len(words_of(text)) == 1 and not answering and words_of(text)[0] not in YES_WORDS | NO_WORDS
+        if not is_command(text, self.language) and not lone:
             self._pending, self._pending_at = pending, self._pending_at  # a question does not cancel it
             self._pass_on(text)
             return
+        text = as_command(text)
         self._pending, self._pending_at = text, time.monotonic()
         self._print(f"  ?  confirm: {text}")
+        self._ask(text)
+
+    def _ask(self, text: str) -> None:
         phrase = PHRASES[self.language]["confirm"]
         self._say_self(phrase.format(text), own=phrase.format(""))
 
@@ -365,6 +409,8 @@ class VoiceAgent:
         if not text:
             return
         self._print(f"  <- planner says: {text}")
+        if text.rstrip().endswith("?"):
+            self._asked_at = time.monotonic()
         if not self.bridge:
             self.voice.note(f"[I said] {text}")
         self._say_self(text)
