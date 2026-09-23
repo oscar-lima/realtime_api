@@ -90,8 +90,17 @@ def build_session(
     transcription_model: str = "gpt-4o-mini-transcribe",
     noise_reduction: Optional[str] = "far_field",
     language: str = "en",
+    create_response: bool = True,
+    transcription_prompt: str = "",
 ) -> Dict[str, Any]:
-    """GA ``session`` object for ``session.update``."""
+    """GA ``session`` object for ``session.update``.
+
+    ``create_response=False`` makes the model speak only when asked
+    (``response.create``, e.g. ``VoiceSession.say``): turn detection and
+    transcription still run, which is what a pure speech bridge needs.
+    ``transcription_prompt`` lists expected words (object names, places) to
+    steer the transcription model.
+    """
     session: Dict[str, Any] = {
         "type": "realtime",
         "instructions": instructions,
@@ -100,18 +109,24 @@ def build_session(
     if audio:
         if vad == "semantic_vad":
             turn = {"type": "semantic_vad", "eagerness": vad_eagerness,
-                    "create_response": True, "interrupt_response": True}
+                    "create_response": create_response, "interrupt_response": True}
         elif vad == "server_vad":
             turn = {"type": "server_vad", "threshold": server_vad_threshold, "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500, "create_response": True, "interrupt_response": True}
+                    "silence_duration_ms": 500, "create_response": create_response, "interrupt_response": True}
         else:
             turn = None
         audio_in: Dict[str, Any] = {
             "format": {"type": "audio/pcm", "rate": API_RATE},
             "turn_detection": turn,
-            "transcription": ({"model": transcription_model, "language": language} if language
-                              else {"model": transcription_model}) if transcription_model else None,
+            "transcription": None,
         }
+        if transcription_model:
+            transcription: Dict[str, Any] = {"model": transcription_model}
+            if language:
+                transcription["language"] = language
+            if transcription_prompt:
+                transcription["prompt"] = transcription_prompt
+            audio_in["transcription"] = transcription
         if noise_reduction:
             audio_in["noise_reduction"] = {"type": noise_reduction}
         session["audio"] = {

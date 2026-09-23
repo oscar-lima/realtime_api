@@ -138,7 +138,8 @@ def run_voice(args: argparse.Namespace) -> int:
     client = RealtimeClient(url, token)
     session = build_session(load_instructions(args), voice=args.voice,
                             tools=None if args.no_tools else [ROBOT_COMMAND_TOOL],
-                            vad=args.vad, vad_eagerness=args.vad_eagerness, language=args.language)
+                            vad=args.vad, vad_eagerness=args.vad_eagerness, language=args.language,
+                            transcription_model=args.transcription_model)
     state = {"speaking": False}
 
     def assistant_delta(delta: str) -> None:

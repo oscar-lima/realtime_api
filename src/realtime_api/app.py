@@ -35,6 +35,9 @@ def add_api_args(p: argparse.ArgumentParser) -> None:
     api.add_argument("--vad-eagerness", choices=["low", "medium", "high", "auto"], default="low",
                      help="low waits for complete sentences (fewer misheard fragments)")
     api.add_argument("--instructions-file", default="")
+    api.add_argument("--transcription-model", default=os.environ.get("REALTIME_TRANSCRIPTION_MODEL",
+                                                                     "gpt-4o-transcribe"),
+                     help="model that turns your speech into text ('' disables transcripts)")
     api.add_argument("--no-tools", action="store_true", help="do not offer send_robot_command")
 
 

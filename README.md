@@ -8,10 +8,9 @@ robot, takes it for the user, and interrupts itself or answers itself.
 Two ways to use it:
 
 - **Mobipick voice agent** (`scripts/realtime_voice_agent`): an optional
-  front end of the mobipick_gpt agents. You speak and Mobipick answers in the
-  first person. Your orders become requests on `/recognized_speech`, and
-  whatever the agents say on `/speak` is spoken in the realtime voice.
-  Tested live in simulation: you talk and the robot moves.
+  speech front end of the mobipick_gpt agents. Everything you say goes to
+  `/recognized_speech` and whatever the agents say on `/speak` is spoken in
+  the realtime voice. Tested live in simulation: you talk and the robot moves.
 - **Standalone demo** (`scripts/realtime_voice_demo`): a conversation without
   ROS, a typed-chat check of the API route, and an echo test that needs no
   API at all.
@@ -133,20 +132,33 @@ waits up to 30 s for it.
 
 | topic | type | direction |
 |---|---|---|
-| `/recognized_speech` | String | out: orders, live-state questions, answers to the robot's questions |
+| `/recognized_speech` | String | out: your utterances (requests, events, answers) |
 | `/speak`, `/realtime/say` | String | in: spoken verbatim in the realtime voice |
 | `/mobipick_gpt/gpt_debug` | String | in: action progress, silent context ("what are you doing?") |
-| `/mobipick_gpt/busy` | Bool | in: a task runs, so new orders are declined politely |
+| `/mobipick_gpt/busy` | Bool | in: an order runs, utterances go to it as events |
 | `/realtime/is_speaking` | Bool | out: robot voice audible (mobipick_gpt `listen` waits for it) |
 | `/realtime/user_transcript`, `/realtime/robot_transcript` | String | out: transcripts |
 
-The prompt is `mobipick_gpt/config/prompts/realtime_voice.txt`, with the
-static facts of `chatbot.txt` filled in at startup
-(`src/realtime_api/mobipick_prompt.py`). The model is Mobipick and speaks in
-the first person ("Understood, I will bring the multimeter to table 2"). Its
-only tool, `execute`, publishes the request to mobipick_gpt. Turn detection
-is semantic VAD with `low` eagerness: it waits for complete sentences, so
-fragments and remarks are not mistaken for orders.
+Two modes (`--mode`, or `REALTIME_MODE`):
+
+- **bridge** (default): a pure speech bridge. Every recognized utterance goes
+  verbatim to `/recognized_speech`, unfiltered, and the mobipick_gpt router,
+  chatbot and planner decide what to do and what to say. The realtime model
+  never replies on its own (`create_response: false`); it only speaks
+  `/speak` and `/realtime/say`. Transcription uses `gpt-4o-transcribe` with a
+  hint listing the robot's objects and places (`--transcription-model`).
+- **agent**: the realtime model is Mobipick's persona
+  (`mobipick_gpt/config/prompts/realtime_voice.txt`, with the static facts of
+  `chatbot.txt` filled in by `src/realtime_api/mobipick_prompt.py`). It
+  answers small talk itself, speaks in the first person, and calls its only
+  tool, `execute`, for orders and live-state questions.
+
+In both modes, while an order runs every utterance also reaches that order as
+an event: mobipick_api buffers `/recognized_speech`, and the planner reads it
+with `check_for_events()` (a "cancel", "stop" or new information) or takes it
+as the answer to its question in `listen()`. Noise transcribed as filler or
+non-Latin text is dropped. Turn detection is semantic VAD with `low`
+eagerness, which waits for complete sentences.
 
 ## Standalone demo
 
@@ -244,6 +256,6 @@ config/litellm_realtime.yaml
 - **WebRTC in the robot container.** livekit needs Python ≥ 3.9. Run the
   voice agent on the host or in a small 22.04+ container next to the Noetic
   one, or use `--aec speex` or `--aec nlms` inside Noetic.
-- **While a task runs**, mobipick_gpt takes only answers to its own
-  questions. The voice agent says it is still busy instead of accepting a
-  new order it could not start.
+- **While an order runs**, mobipick_gpt starts no new workflow; your words
+  reach the running order as events, so "cancel" works when the planner
+  checks for events between actions.

@@ -2,12 +2,22 @@
 """Mobipick voice agent: talk to the robot through the OpenAI Realtime API.
 
 An optional front end to the mobipick_gpt agents, replacing speech
-recognition + TTS. You speak; the realtime model (the robot's persona, with
-the chatbot's knowledge) answers small talk itself and forwards every task,
-live-state question and answer to the planner's questions to mobipick_gpt
-on /recognized_speech. Everything the agents say on /speak (and anything
+recognition + TTS. Everything the agents say on /speak (and anything
 published on /realtime/say) is spoken verbatim in the realtime voice, with
-the robot's own voice cancelled from the microphone.
+the robot's own voice cancelled from the microphone. Two modes:
+
+  bridge (default)  a pure speech bridge: every recognized utterance goes
+                    verbatim to /recognized_speech, unfiltered, and the
+                    mobipick_gpt router, chatbot and planner decide what to
+                    do and what to answer. The realtime model never replies
+                    on its own; it only speaks /speak.
+  agent             the realtime model is Mobipick's persona
+                    (mobipick_gpt/config/prompts/realtime_voice.txt): it
+                    answers small talk itself and calls "execute" for orders
+                    and live-state questions.
+
+In both modes, while an order runs every utterance also reaches it as an
+event (check_for_events(), listen()).
 
 ROS is reached over rosbridge (roslibpy), so this runs where the microphone
 and speaker are, e.g. on the host next to the Mobipick containers.
@@ -20,7 +30,7 @@ Topics
   subscribes  /speak                        std_msgs/String  said verbatim (mobipick_gpt output)
               /realtime/say                 std_msgs/String  said verbatim (anything else)
               /mobipick_gpt/gpt_debug       std_msgs/String  action progress, kept as silent context
-              /mobipick_gpt/busy            std_msgs/Bool    a task runs: new requests would be ignored
+              /mobipick_gpt/busy            std_msgs/Bool    a task runs: every utterance goes out as an event
 
 Examples
   realtime_voice_agent                                  # host defaults: rosbridge ws://localhost:9090, LiteLLM :4000
@@ -32,6 +42,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -68,6 +79,27 @@ MOBIPICK_TOOL = {
 }
 
 
+BRIDGE_INSTRUCTIONS = (
+    "You are the voice of Mobipick, a mobile manipulation robot. You never answer the person yourself; "
+    "you only read aloud, exactly as written and in a natural friendly tone, the sentences you are asked to say."
+)
+
+# Steers the transcription towards the robot's world (known objects and places).
+TRANSCRIPTION_HINT = (
+    "Mobipick robot commands. Objects: coke, sugar box, relay, screwdriver, multimeter, power drill, "
+    "hot glue gun, blue box, klt, bleach, mustard, soup, meat. Places: table 1, table 2, table 3. "
+    "Words: pick, place, insert, bring, navigate, inspect, perceive, cancel, stop."
+)
+
+FILLER = {"mm", "mhm", "hm", "hmm", "uh", "um", "ah", "eh", "oh", "uh-huh", "mm-hmm"}
+
+
+def is_speech(text: str) -> bool:
+    """Words worth passing on as an event, not noise transcribed as filler or a stray script."""
+    words = re.findall(r"[A-Za-zÄÖÜäöüß']+", text)
+    return bool(words) and not all(w.lower() in FILLER for w in words)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_api_args(p)
@@ -79,6 +111,9 @@ def parse_args() -> argparse.Namespace:
     ros.add_argument("--say-topic", default="/realtime/say")
     ros.add_argument("--debug-topic", default="/mobipick_gpt/gpt_debug", help="'' to ignore agent progress")
     ros.add_argument("--busy-topic", default="/mobipick_gpt/busy")
+    p.add_argument("--mode", choices=["bridge", "agent"], default=os.environ.get("REALTIME_MODE", "bridge"),
+                   help="bridge: pass every utterance to mobipick_gpt unfiltered (default); agent: the realtime "
+                        "model answers small talk itself and decides what to execute")
     ros.add_argument("--prompt-dir", default=os.environ.get("MOBIPICK_PROMPT_DIR", DEFAULT_PROMPT_DIR))
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
@@ -92,15 +127,22 @@ class VoiceAgent:
         url, token = resolve_endpoint(args.backend, args.model, args.litellm_url, args.api_key)
         self.url = url
         self.client = RealtimeClient(url, token)
-        instructions = (open(args.instructions_file).read() if args.instructions_file
-                        else build_instructions(args.prompt_dir))
+        self.bridge = args.mode == "bridge"
+        if args.instructions_file:
+            instructions = open(args.instructions_file).read()
+        elif self.bridge:
+            instructions = BRIDGE_INSTRUCTIONS
+        else:
+            instructions = build_instructions(args.prompt_dir)
         self.session_config = build_session(
-            instructions, voice=args.voice, tools=None if args.no_tools else [MOBIPICK_TOOL],
-            vad=args.vad, vad_eagerness=args.vad_eagerness, language=args.language)
+            instructions, voice=args.voice,
+            tools=None if (args.no_tools or self.bridge) else [MOBIPICK_TOOL],
+            vad=args.vad, vad_eagerness=args.vad_eagerness, language=args.language,
+            create_response=not self.bridge, transcription_model=args.transcription_model,
+            transcription_prompt=TRANSCRIPTION_HINT)
         self._speaking = False
         self._line_open = False
         self._busy = False
-        self._question_at = 0.0  # when the agents last asked the person something
         self.voice = VoiceSession(
             self.client, self.engine,
             on_user_text=self._on_user_text,
@@ -118,16 +160,26 @@ class VoiceAgent:
             return
         self._print(f"you>   {text}")
         self.ros.publish("/realtime/user_transcript", text)
+        if (self.bridge or self._busy) and is_speech(text):
+            # Bridge mode: every utterance is a request for mobipick_gpt.
+            # While an order runs (both modes) it is an event for that order:
+            # mobipick_api's HRI buffers /recognized_speech, the planner reads it
+            # with check_for_events() ("cancel", "stop", new information) and
+            # listen() takes it as the answer to a question; the runner starts
+            # no new workflow then.
+            self._print(f"  -> {'event' if self._busy else 'request'}: {text}")
+            self.ros.publish(self.args.goal_topic, text)
 
     def _on_tool_call(self, name: str, arguments: dict) -> dict:
         request = str(arguments.get("request", "")).strip()
         if name != MOBIPICK_TOOL["name"] or not request:
             return {"error": f"unknown tool {name} or empty request"}
-        # While a task runs mobipick_gpt only takes answers to its own questions.
-        if self._busy and time.monotonic() - self._question_at > 90.0:
-            self._print(f"  x  not executed, still busy: {request}")
-            return {"status": "not started: you are still busy with the previous order and cannot take a new "
-                              "one until it is finished."}
+        if self._busy:
+            # the person's own words already went to the running order as an event
+            self._print(f"  x  busy, words passed as event instead: {request}")
+            return {"status": "you are busy with an order; the person's words already reached it as an event "
+                              "(a stop or cancel, new information, or an answer to your question) and it will "
+                              "react at its next step. A new order can only start after this one finishes."}
         self._print(f"  -> execute: {request}")
         self.ros.publish(self.args.goal_topic, request)
         return {"status": "started; progress, results and questions will come as [I said] and [status] messages"}
@@ -135,9 +187,9 @@ class VoiceAgent:
     def _on_busy(self, busy: bool) -> None:
         if busy != self._busy:
             self._busy = busy
-            self.voice.note("[status] " + ("I started working on an order and cannot take new orders until "
-                                           "it is finished" if busy else "I finished my order and can take "
-                                           "new orders"))
+            self.voice.note("[status] " + ("I started working on an order; until it is finished everything "
+                                           "the person says reaches it directly as an event" if busy else
+                                           "I finished my order and can take new orders"))
 
     # ---------------------------------------------------------------- agents -> person
 
@@ -146,8 +198,6 @@ class VoiceAgent:
         if not text:
             return
         self._print(f"  <- planner says: {text}")
-        if text.rstrip().endswith("?"):
-            self._question_at = time.monotonic()
         self.voice.note(f"[I said] {text}")
         self.voice.say(text)
 
@@ -238,4 +288,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # skip interpreter finalizers: livekit's FFI handles assert while being
+    # garbage collected at exit and print a misleading traceback
+    os._exit(code)
