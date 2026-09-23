@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Mobipick voice agent: talk to the robot through the OpenAI Realtime API.
+
+An optional front end to the mobipick_gpt agents, replacing speech
+recognition + TTS. You speak; the realtime model (the robot's persona, with
+the chatbot's knowledge) answers small talk itself and forwards every task,
+live-state question and answer to the planner's questions to mobipick_gpt
+on /recognized_speech. Everything the agents say on /speak (and anything
+published on /realtime/say) is spoken verbatim in the realtime voice, with
+the robot's own voice cancelled from the microphone.
+
+ROS is reached over rosbridge (roslibpy), so this runs where the microphone
+and speaker are, e.g. on the host next to the Mobipick containers.
+
+Topics
+  publishes   /recognized_speech            std_msgs/String  tasks, questions, answers -> mobipick_gpt
+              /realtime/user_transcript     std_msgs/String  what the person said
+              /realtime/robot_transcript    std_msgs/String  what the robot said
+              /realtime/is_speaking         std_msgs/Bool    robot voice active
+  subscribes  /speak                        std_msgs/String  said verbatim (mobipick_gpt output)
+              /realtime/say                 std_msgs/String  said verbatim (anything else)
+              /mobipick_gpt/gpt_debug       std_msgs/String  action progress, kept as silent context
+              /mobipick_gpt/busy            std_msgs/Bool    a task runs: new requests would be ignored
+
+Examples
+  realtime_voice_agent                                  # host defaults: rosbridge ws://localhost:9090, LiteLLM :4000
+  realtime_voice_agent --voice echo --input ALU1 --output Pebble
+  rostopic pub -1 /realtime/say std_msgs/String "data: 'Hello, I am Mobipick.'"
+"""
+
+import argparse
+import json
+import logging
+import os
+import signal
+import sys
+import threading
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+from realtime_api.app import (  # noqa: E402
+    add_api_args, add_audio_args, connect, make_engine, save_debug, save_echo_delay, start_meter,
+)
+from realtime_api.mobipick_prompt import DEFAULT_PROMPT_DIR, build_instructions  # noqa: E402
+from realtime_api.realtime_client import RealtimeClient, build_session, resolve_endpoint  # noqa: E402
+from realtime_api.ros_bridge import RosStringBridge, rosbridge_url  # noqa: E402
+from realtime_api.voice_session import VoiceSession  # noqa: E402
+
+_LOG = logging.getLogger("realtime_voice_agent")
+
+MOBIPICK_TOOL = {
+    "type": "function",
+    "name": "execute",
+    "description": (
+        "Use your body and senses: start a physical task, check the live state of the world, or give the "
+        "person's answer to a question you asked while working. Your planning and execution then carries "
+        "it out and reports back through what you say."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "request": {"type": "string", "description": "One clear, complete English instruction or question, "
+                        "keeping object names and locations exactly as the person said them."},
+        },
+        "required": ["request"],
+    },
+}
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_api_args(p)
+    add_audio_args(p)
+    ros = p.add_argument_group("ros")
+    ros.add_argument("--rosbridge-url", default=rosbridge_url())
+    ros.add_argument("--goal-topic", default="/recognized_speech")
+    ros.add_argument("--speak-topic", default="/speak")
+    ros.add_argument("--say-topic", default="/realtime/say")
+    ros.add_argument("--debug-topic", default="/mobipick_gpt/gpt_debug", help="'' to ignore agent progress")
+    ros.add_argument("--busy-topic", default="/mobipick_gpt/busy")
+    ros.add_argument("--prompt-dir", default=os.environ.get("MOBIPICK_PROMPT_DIR", DEFAULT_PROMPT_DIR))
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p.parse_args()
+
+
+class VoiceAgent:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.ros = RosStringBridge(args.rosbridge_url)
+        self.engine = make_engine(args)
+        url, token = resolve_endpoint(args.backend, args.model, args.litellm_url, args.api_key)
+        self.url = url
+        self.client = RealtimeClient(url, token)
+        instructions = (open(args.instructions_file).read() if args.instructions_file
+                        else build_instructions(args.prompt_dir))
+        self.session_config = build_session(
+            instructions, voice=args.voice, tools=None if args.no_tools else [MOBIPICK_TOOL],
+            vad=args.vad, vad_eagerness=args.vad_eagerness, language=args.language)
+        self._speaking = False
+        self._line_open = False
+        self._busy = False
+        self._question_at = 0.0  # when the agents last asked the person something
+        self.voice = VoiceSession(
+            self.client, self.engine,
+            on_user_text=self._on_user_text,
+            on_assistant_delta=self._on_robot_delta,
+            on_assistant_text=self._on_robot_text,
+            on_tool_call=self._on_tool_call,
+        )
+        self.stop = threading.Event()
+        self.client.on("connection.closed", lambda e: self.stop.set())
+
+    # ---------------------------------------------------------------- person -> agents
+
+    def _on_user_text(self, text: str) -> None:
+        if not text:
+            return
+        self._print(f"you>   {text}")
+        self.ros.publish("/realtime/user_transcript", text)
+
+    def _on_tool_call(self, name: str, arguments: dict) -> dict:
+        request = str(arguments.get("request", "")).strip()
+        if name != MOBIPICK_TOOL["name"] or not request:
+            return {"error": f"unknown tool {name} or empty request"}
+        # While a task runs mobipick_gpt only takes answers to its own questions.
+        if self._busy and time.monotonic() - self._question_at > 90.0:
+            self._print(f"  x  not executed, still busy: {request}")
+            return {"status": "not started: you are still busy with the previous order and cannot take a new "
+                              "one until it is finished."}
+        self._print(f"  -> execute: {request}")
+        self.ros.publish(self.args.goal_topic, request)
+        return {"status": "started; progress, results and questions will come as [I said] and [status] messages"}
+
+    def _on_busy(self, busy: bool) -> None:
+        if busy != self._busy:
+            self._busy = busy
+            self.voice.note("[status] " + ("I started working on an order and cannot take new orders until "
+                                           "it is finished" if busy else "I finished my order and can take "
+                                           "new orders"))
+
+    # ---------------------------------------------------------------- agents -> person
+
+    def _on_speak(self, text: str) -> None:
+        text = text.strip()
+        if not text:
+            return
+        self._print(f"  <- planner says: {text}")
+        if text.rstrip().endswith("?"):
+            self._question_at = time.monotonic()
+        self.voice.note(f"[I said] {text}")
+        self.voice.say(text)
+
+    def _on_debug(self, raw: str) -> None:
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return
+        if data.get("kind") == "act":
+            text = str(data.get("text", "")).strip()
+            if text:
+                _LOG.info("robot status: %s", text)
+                self.voice.note(f"[status] {text}")
+
+    def _on_robot_delta(self, delta: str) -> None:
+        if not self._line_open:
+            print("robot> ", end="", flush=True)
+            self._line_open = True
+        print(delta, end="", flush=True)
+
+    def _on_robot_text(self, text: str) -> None:
+        if self._line_open:
+            print(flush=True)
+            self._line_open = False
+        if text:
+            self.ros.publish("/realtime/robot_transcript", text)
+
+    def _print(self, line: str) -> None:
+        if self._line_open:
+            print(flush=True)
+            self._line_open = False
+        print(line, flush=True)
+
+    def _watch_speaking(self) -> None:
+        while not self.stop.wait(0.1):
+            speaking = self.engine.is_playing()
+            if speaking != self._speaking:
+                self._speaking = speaking
+                self.ros.publish_bool("/realtime/is_speaking", speaking)
+
+    # ---------------------------------------------------------------- run
+
+    def run(self) -> int:
+        if not connect(self.client, self.url, self.session_config):
+            return 1
+        self.ros.subscribe(self.args.speak_topic, self._on_speak)
+        self.ros.subscribe(self.args.say_topic, self._on_speak)
+        if self.args.debug_topic:
+            self.ros.subscribe(self.args.debug_topic, self._on_debug)
+        if self.args.busy_topic:
+            self.ros.subscribe_bool(self.args.busy_topic, self._on_busy)
+        threading.Thread(target=self._watch_speaking, daemon=True).start()
+        if self.args.meter:
+            start_meter(self.engine, self.stop)
+        print(f"Mobipick voice agent ready (voice {self.args.voice}, echo canceller {self.engine.aec.name}). "
+              f"Tasks go to {self.args.goal_topic}, {self.args.speak_topic} is spoken. Ctrl-C to quit.", flush=True)
+        self.voice.say("Hello, I am Mobipick. How can I help you?")
+        self.stop.wait()
+        return 0
+
+    def shutdown(self) -> None:
+        self.stop.set()
+        self.client.close()
+        self.engine.stop()
+        save_echo_delay(self.args, self.engine)
+        self.ros.close()
+        save_debug(self.engine, self.args.debug_dir)
+
+
+def main() -> int:
+    args = parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s %(name)s: %(message)s")
+    for noisy in ("roslibpy", "autobahn", "twisted"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    try:
+        agent = VoiceAgent(args)
+    except ConnectionError as exc:
+        print(f"{exc}\nIs GPT Robot Demo running? It starts rosbridge on :9090.")
+        return 1
+    signal.signal(signal.SIGINT, lambda *_: agent.stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: agent.stop.set())
+    try:
+        return agent.run()
+    finally:
+        agent.shutdown()
+        time.sleep(0.2)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

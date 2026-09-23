@@ -275,7 +275,6 @@ class NlmsEchoCanceller(EchoCanceller):
         W += mu * np.fft.rfft(g, axis=1)
 
     def process(self, mic: np.ndarray, ref: np.ndarray) -> np.ndarray:
-        B = self._B
         m = mic.astype(np.float64) / 32768.0
         r = ref.astype(np.float64) / 32768.0
 

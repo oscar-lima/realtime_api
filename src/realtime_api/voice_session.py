@@ -8,6 +8,7 @@ mobipick_gpt agents.
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import threading
@@ -78,6 +79,7 @@ class VoiceSession:
         self.response_active = False
         self.interruptions = 0
         self._interrupted: "set[str]" = set()  # items whose remaining audio must not play
+        self._say_queue: "collections.deque[str]" = collections.deque()
 
         client.on("response.created", self._on_response_created)
         client.on("response.output_audio.delta", self._on_audio_delta)
@@ -109,6 +111,46 @@ class VoiceSession:
 
     def _on_response_created(self, event: Dict[str, Any]) -> None:
         self.response_active = True
+
+    # ------------------------------------------------------------ robot side
+
+    def say(self, text: str) -> None:
+        """Speak ``text`` verbatim in the session's voice (e.g. from /speak).
+
+        Queued while an answer is streaming so it never cuts the model off.
+        The sentence becomes part of the conversation, so the model knows
+        what the robot said.
+        """
+        text = text.strip()
+        if not text:
+            return
+        with self._lock:
+            self._say_queue.append(text)
+            busy = self.response_active
+        if not busy:
+            self._flush_say()
+
+    def note(self, text: str) -> None:
+        """Add silent context (robot status) the model can use later."""
+        self.client.send({
+            "type": "conversation.item.create",
+            "item": {"type": "message", "role": "system", "content": [{"type": "input_text", "text": text}]},
+        })
+
+    def _flush_say(self) -> None:
+        with self._lock:
+            if self.response_active or not self._say_queue:
+                return
+            text = self._say_queue.popleft()
+            self.response_active = True  # until response.created/done arrive
+        self.client.send({
+            "type": "response.create",
+            "response": {
+                "instructions": ("Read the following text aloud exactly as written, in the first person, "
+                                 "without adding, removing or commenting on anything:\n" + text),
+                "tool_choice": "none",
+            },
+        })
 
     def _on_audio_delta(self, event: Dict[str, Any]) -> None:
         # deltas of an interrupted answer can still be in flight: drop them
@@ -149,6 +191,7 @@ class VoiceSession:
         response = event.get("response", {})
         calls = [o for o in response.get("output", []) if o.get("type") == "function_call"]
         if not calls:
+            self._flush_say()
             return
         for call in calls:
             name = call.get("name", "")

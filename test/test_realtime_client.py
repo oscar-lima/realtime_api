@@ -71,7 +71,7 @@ def test_session_shapes():
     assert ga["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
     assert ga["audio"]["input"]["turn_detection"]["interrupt_response"] is True
     beta = ga_to_beta_session(ga)
-    assert beta["input_audio_format"] == "pcm16" and beta["voice"] == "marin"
+    assert beta["input_audio_format"] == "pcm16" and beta["voice"] == "cedar"
     assert beta["tools"][0]["name"] == "send_robot_command"
     assert "audio" not in build_session("hi", audio=False)
 

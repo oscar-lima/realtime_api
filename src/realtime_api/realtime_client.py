@@ -81,7 +81,7 @@ def resolve_endpoint(
 
 def build_session(
     instructions: str,
-    voice: str = "marin",
+    voice: str = "cedar",
     tools: Optional[List[Dict[str, Any]]] = None,
     audio: bool = True,
     vad: str = "semantic_vad",
@@ -134,7 +134,7 @@ def ga_to_beta_session(session: Dict[str, Any]) -> Dict[str, Any]:
     if audio:
         beta["input_audio_format"] = "pcm16"
         beta["output_audio_format"] = "pcm16"
-        beta["voice"] = audio.get("output", {}).get("voice", "alloy")
+        beta["voice"] = audio.get("output", {}).get("voice", "cedar")
         audio_in = audio.get("input", {})
         beta["turn_detection"] = audio_in.get("turn_detection")
         beta["input_audio_transcription"] = audio_in.get("transcription")

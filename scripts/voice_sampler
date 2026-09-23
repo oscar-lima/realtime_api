@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Play one sentence in each robot voice (cedar, echo) to compare them.
+
+  voice_sampler                      # cedar, then echo
+  voice_sampler echo                 # only echo
+  voice_sampler --text "Hello, I am Mobipick." --output Pebble
+
+The voice is fixed per session once the model has spoken, so every voice
+gets its own short session (a few hundred tokens each).
+"""
+
+import argparse
+import os
+import sys
+import threading
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+from realtime_api.app import VOICES, connect  # noqa: E402
+from realtime_api.duplex_audio import find_device  # noqa: E402
+from realtime_api.realtime_client import API_RATE, RealtimeClient, build_session, resolve_endpoint  # noqa: E402
+
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("voices", nargs="*", help="any of: " + ", ".join(VOICES))
+    p.add_argument("--text", default="Hello, I am Mobipick, a mobile manipulator from DFKI. "
+                                      "Tell me what to pick and where to bring it.")
+    p.add_argument("--backend", choices=["litellm", "openai"], default="litellm")
+    p.add_argument("--model", default=os.environ.get("REALTIME_MODEL", "gpt-realtime-2.1-mini"))
+    p.add_argument("--litellm-url", default="")
+    p.add_argument("--output", default=os.environ.get("REALTIME_OUTPUT_DEVICE"))
+    args = p.parse_args()
+    unknown = [v for v in args.voices if v not in VOICES]
+    if unknown:
+        p.error(f"unknown voice(s) {unknown}; choose from {VOICES}")
+
+    import sounddevice as sd
+
+    device = find_device(args.output, "output")
+    url, token = resolve_endpoint(args.backend, args.model, args.litellm_url)
+    for voice in args.voices or VOICES:
+        client = RealtimeClient(url, token)
+        chunks = []
+        done = threading.Event()
+        client.on("response.output_audio.delta", lambda e: chunks.append(RealtimeClient.decode_audio(e)))
+        client.on("response.done", lambda e: done.set())
+        client.on("connection.closed", lambda e: done.set())
+        session = build_session("You are a voice actor. Read the requested text aloud exactly.", voice=voice,
+                                vad="none", transcription_model="")
+        if not connect(client, url, session):
+            return 1
+        client.send({"type": "response.create", "response": {
+            "instructions": "Read this aloud exactly as written: " + args.text}})
+        done.wait(30)
+        client.close()
+        if not chunks:
+            print(f"{voice}: no audio ({client.last_error})")
+            continue
+        print(voice, flush=True)
+        sd.play(np.concatenate(chunks), API_RATE, device=device, blocking=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

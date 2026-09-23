@@ -31,8 +31,11 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from realtime_api.audio_utils import dbfs, read_wav_mono, write_wav_mono  # noqa: E402
-from realtime_api.duplex_audio import FRAME, PROC_RATE, DuplexAudioEngine  # noqa: E402
+from realtime_api.app import (  # noqa: E402
+    add_api_args, add_audio_args, connect, make_engine, save_debug, save_echo_delay, start_meter,
+)
+from realtime_api.audio_utils import dbfs, read_wav_mono  # noqa: E402
+from realtime_api.duplex_audio import FRAME, PROC_RATE  # noqa: E402
 from realtime_api.echo_cancel import available_backends  # noqa: E402
 from realtime_api.realtime_client import RealtimeClient, build_session, resolve_endpoint  # noqa: E402
 from realtime_api.voice_session import DEFAULT_INSTRUCTIONS, ROBOT_COMMAND_TOOL, VoiceSession  # noqa: E402
@@ -48,74 +51,10 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--text", action="store_true", help="text-only chat over the realtime API")
     mode.add_argument("--echo-test", action="store_true", help="offline echo test, no network")
 
-    api = p.add_argument_group("api")
-    api.add_argument("--backend", choices=["litellm", "openai"], default="litellm")
-    api.add_argument("--model", default=os.environ.get("REALTIME_MODEL", "gpt-realtime-2.1-mini"),
-                     help="LiteLLM alias or OpenAI model id")
-    api.add_argument("--litellm-url", default="", help="default $LITELLM_BASE_URL or http://127.0.0.1:4000/v1")
-    api.add_argument("--api-key", default="", help="default $LITELLM_API_KEY / $OPENAI_API_KEY or key files")
-    api.add_argument("--voice", default="marin")
-    api.add_argument("--language", default="en",
-                     help="language hint for the user transcript ('' = auto-detect)")
-    api.add_argument("--vad", choices=["semantic_vad", "server_vad"], default="semantic_vad")
-    api.add_argument("--vad-eagerness", choices=["low", "medium", "high", "auto"], default="auto")
-    api.add_argument("--instructions-file", default="")
-    api.add_argument("--no-tools", action="store_true", help="do not offer send_robot_command")
-
-    audio = p.add_argument_group("audio")
-    audio.add_argument("--input", default=os.environ.get("REALTIME_INPUT_DEVICE"),
-                       help="mic index or name substring (e.g. ALU1)")
-    audio.add_argument("--output", default=os.environ.get("REALTIME_OUTPUT_DEVICE"),
-                       help="speaker index or name substring (e.g. Pebble)")
-    audio.add_argument("--aec", default="auto", choices=["auto", "webrtc", "speex", "nlms", "none"])
-    audio.add_argument("--gate", default="smart", choices=["smart", "half", "full"],
-                       help="smart: pass user speech over the robot (barge-in), half: mute mic while "
-                            "the robot talks, full: trust the AEC completely")
-    audio.add_argument("--echo-delay-ms", type=float, default=0.0)
-    audio.add_argument("--lead-ms", type=float, default=40.0)
-    audio.add_argument("--no-calibrate", action="store_true", help="skip the startup noise-burst calibration")
-    audio.add_argument("--output-gain", type=float, default=1.0)
-    audio.add_argument("--mic-gain", type=float, default=1.0)
-    audio.add_argument("--debug-dir", default="", help="save mic/reference/aec/sent wavs here on exit")
-    audio.add_argument("--meter", action="store_true", help="print audio levels every 2 s")
+    add_api_args(p)
+    add_audio_args(p)
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
-
-
-def make_engine(args: argparse.Namespace) -> DuplexAudioEngine:
-    engine = DuplexAudioEngine(
-        input_device=args.input, output_device=args.output, aec_backend=args.aec, gate_mode=args.gate,
-        echo_delay_ms=args.echo_delay_ms, ref_lead_ms=args.lead_ms, output_gain=args.output_gain,
-        mic_gain=args.mic_gain, record_debug=bool(args.debug_dir),
-    )
-    engine.start()
-    if not args.no_calibrate:
-        print("calibrating echo path (short noise bursts) ...", flush=True)
-        lag, conf = engine.calibrate()
-        print(f"  echo delay {engine.echo_delay_s * 1000:.0f} ms (lag {lag:.0f} ms, confidence {conf:.0f})"
-              + ("" if conf >= 8 else "  <- weak echo; is the speaker on and loud enough?"), flush=True)
-    return engine
-
-
-def save_debug(engine: DuplexAudioEngine, directory: str) -> None:
-    if not directory or not engine.debug_mic:
-        return
-    os.makedirs(directory, exist_ok=True)
-    for name, frames in (("mic", engine.debug_mic), ("reference", engine.debug_ref),
-                         ("aec_out", engine.debug_out), ("sent", engine.debug_sent)):
-        write_wav_mono(os.path.join(directory, f"{name}.wav"), np.concatenate(frames), PROC_RATE)
-    print(f"debug wavs written to {directory}")
-
-
-def start_meter(engine: DuplexAudioEngine, stop: threading.Event) -> None:
-    def loop() -> None:
-        while not stop.wait(2.0):
-            s = engine.stats
-            delay = engine.last_delay
-            print(f"  [mic {s['mic_db']:6.1f} dBFS | aec out {s['out_db']:6.1f} | ref {s['ref_db']:6.1f} | "
-                  f"ERLE {s['erle_db']:5.1f} dB | gate {'open' if s.get('gate_open') else 'shut'}"
-                  + (f" | echo lag {delay[0]:.0f} ms" if delay else "") + "]", flush=True)
-    threading.Thread(target=loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------- modes
@@ -237,28 +176,12 @@ def run_voice(args: argparse.Namespace) -> int:
     finally:
         client.close()
         engine.stop()
+        save_echo_delay(args, engine)
         save_debug(engine, args.debug_dir)
     return 0
 
 
 # ---------------------------------------------------------------- helpers
-
-
-def connect(client: RealtimeClient, url: str, session: dict) -> bool:
-    print(f"connecting to {url} ...", flush=True)
-    try:
-        client.connect(session)
-    except Exception as exc:  # handshake refused, proxy down, bad key, ...
-        print(f"could not connect: {exc}".split(" -+-+- ")[0])
-        if "401" in str(exc) or "403" in str(exc):
-            print("check the key: LiteLLM needs its master key ($LITELLM_API_KEY or "
-                  "amenable_ws/src/litellm_master_key), OpenAI direct needs $OPENAI_API_KEY")
-        return False
-    if not client.wait_ready(15):
-        print(f"session not ready: {client.last_error or 'connection closed'}")
-        client.close()
-        return False
-    return True
 
 
 def load_instructions(args: argparse.Namespace) -> str:
