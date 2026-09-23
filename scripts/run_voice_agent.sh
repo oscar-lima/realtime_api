@@ -2,10 +2,25 @@
 # Start the Mobipick voice agent on the host (GUI button "Voice Agent").
 # Needs: GPT Robot Demo (rosbridge :9090, the agents) and LiteLLM (:4000) running,
 # and scripts/install_host.sh run once. Extra arguments go to realtime_voice_agent,
-# e.g. --voice ash --input ALU1 --output Pebble. Environment overrides:
+# e.g. --voice echo --input ALU1 --output Pebble. Environment overrides:
 # REALTIME_VOICE, REALTIME_MODEL, REALTIME_INPUT_DEVICE, REALTIME_OUTPUT_DEVICE,
 # LITELLM_BASE_URL, ROSBRIDGE_URL.
 set -euo pipefail
+
+# The GUI appends its toolbar dropdown as voice_agent:=off|cedar|echo.
+# off keeps the classic workflow: commands come from the GUI or /recognized_speech.
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    voice_agent:=off)
+      printf 'voice agent is off (toolbar voice_agent=off): send commands through the GUI or /recognized_speech\n'
+      exit 0 ;;
+    voice_agent:=*) args+=(--voice "${arg#voice_agent:=}") ;;
+    *) args+=("$arg") ;;
+  esac
+done
+set -- "${args[@]+"${args[@]}"}"
+
 package_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 workspace_src="$(dirname -- "$package_dir")"
 python="$package_dir/.venv/bin/python"

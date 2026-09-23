@@ -5,12 +5,16 @@ routed through LiteLLM. Its main job is to stop the robot's own voice from
 getting back into the microphone. Without that, the Realtime API hears the
 robot, takes it for the user, and interrupts itself or answers itself.
 
-Status: a standalone dry-run demo with no ROS. Everything was tested except
-a live conversation: the OpenAI project has hit its spend limit
-(`project_spend_limit_exceeded`). That error comes back correctly through
-LiteLLM, so the route itself works. The `send_robot_command` tool
-only prints the command. Plugging it into `mobipick_gpt` as an optional agent
-is the next step (see [Next steps](#next-steps)).
+Two ways to use it:
+
+- **Mobipick voice agent** (`scripts/realtime_voice_agent`): an optional
+  front end of the mobipick_gpt agents. You speak and Mobipick answers in the
+  first person. Your orders become requests on `/recognized_speech`, and
+  whatever the agents say on `/speak` is spoken in the realtime voice.
+  Tested live in simulation: you talk and the robot moves.
+- **Standalone demo** (`scripts/realtime_voice_demo`): a conversation without
+  ROS, a typed-chat check of the API route, and an echo test that needs no
+  API at all.
 
 ## How the echo is removed
 
@@ -29,10 +33,12 @@ microphone ─► InputStream ─(ADC timestamp t)─► AEC(mic, reference) ─
 1. **Timestamp alignment.** Every speaker sample is stored with its DAC time
    and every mic frame gets its ADC time. The mic and speaker can be different
    USB devices (ALU1 mic, Pebble speaker).
-2. **Calibration.** At startup, a few short noise bursts (about 1 s each)
-   measure where the echo really lands. Device-reported latencies are often
-   wrong: PipeWire was 30–35 ms off. A background GCC-PHAT tracker keeps
-   checking this during robot speech and corrects drift.
+2. **Echo delay.** Device-reported latencies are often wrong (PipeWire was
+   30–35 ms off), so the real echo delay is measured and cached per mic and
+   speaker pair in `~/.cache/realtime_api/echo_delay.json`. A background
+   GCC-PHAT tracker checks it during robot speech, corrects drift, and the
+   corrected value is saved on exit. `--calibrate` measures it at startup
+   with a few short noise bursts instead; it is rarely needed.
 3. **Acoustic echo canceller** (`--aec`):
    - `webrtc`: WebRTC AEC3 via `livekit` (`pip install livekit`, Python ≥ 3.9). Best.
    - `speex`: SpeexDSP through ctypes on `libspeexdsp.so.1`. Already in the
@@ -95,17 +101,54 @@ process.
 
 ## Install
 
+On the host (Ubuntu 24.04, Python 3.12), once:
+
 ```bash
 cd ~/ros1_ws/amenable_ws/src/realtime_api
-pip install -r requirements.txt          # numpy scipy sounddevice websocket-client (+ livekit on py>=3.9)
-sudo apt install libportaudio2 libspeexdsp1   # if missing
+scripts/install_host.sh        # .venv with numpy scipy sounddevice websocket-client livekit roslibpy
+sudo apt install libportaudio2 libspeexdsp1   # only if the script reports them missing
 ```
 
-On the host (Ubuntu 24.04, Python 3.12), all three AEC backends are
-available. In the Noetic container (Python 3.8) you also need
-`pip3 install sounddevice`. Speex and NLMS are available there, WebRTC is not.
+All three echo cancellers work there. In the Noetic container (Python 3.8),
+`pip3 install sounddevice roslibpy` is enough; Speex and NLMS work there,
+WebRTC does not.
 
-## Run
+## Mobipick voice agent
+
+In the Mobipick Labs GUI, choose the voice in the `voice_agent` dropdown
+(`off` is the classic text workflow, `cedar` is the default robot voice,
+`echo` the alternative) and press Auto Launch, or press **Voice Agent** once
+GPT Robot Demo and LiteLLM are running. By hand:
+
+```bash
+scripts/run_voice_agent.sh                       # cedar, laptop mic and speaker
+scripts/run_voice_agent.sh --voice echo --input ALU1 --output Pebble
+scripts/voice_sampler                            # hear cedar and echo
+```
+
+`run_voice_agent.sh` uses the venv, the LiteLLM master key and LiteLLM on
+:4000 (`gpt-realtime-2.1-mini`, or `--model gpt-realtime-2.1`). It finds
+GPT Robot Demo's rosbridge on the `mobipick` Docker network by itself and
+waits up to 30 s for it.
+
+| topic | type | direction |
+|---|---|---|
+| `/recognized_speech` | String | out: orders, live-state questions, answers to the robot's questions |
+| `/speak`, `/realtime/say` | String | in: spoken verbatim in the realtime voice |
+| `/mobipick_gpt/gpt_debug` | String | in: action progress, silent context ("what are you doing?") |
+| `/mobipick_gpt/busy` | Bool | in: a task runs, so new orders are declined politely |
+| `/realtime/is_speaking` | Bool | out: robot voice audible (mobipick_gpt `listen` waits for it) |
+| `/realtime/user_transcript`, `/realtime/robot_transcript` | String | out: transcripts |
+
+The prompt is `mobipick_gpt/config/prompts/realtime_voice.txt`, with the
+static facts of `chatbot.txt` filled in at startup
+(`src/realtime_api/mobipick_prompt.py`). The model is Mobipick and speaks in
+the first person ("Understood, I will bring the multimeter to table 2"). Its
+only tool, `execute`, publishes the request to mobipick_gpt. Turn detection
+is semantic VAD with `low` eagerness: it waits for complete sentences, so
+fragments and remarks are not mistaken for orders.
+
+## Standalone demo
 
 ### 1. Check the echo cancellation (no API, no cost)
 
@@ -126,33 +169,28 @@ scripts/aec_loopback_test --replay /tmp/aec_test --near-db -6    # re-analyse, u
 If it warns that the echo is barely above the room noise, raise the speaker
 volume or pass `--output-gain`.
 
-### 2. Start LiteLLM with a realtime model
+### 2. LiteLLM
 
-This uses the same pinned image, OpenAI key file and master key as
-`mobipick_gpt`. It listens on port 4001 so it does not clash with the main
-proxy on 4000:
-
-```bash
-scripts/run_litellm_realtime.sh
-```
-
-To serve realtime from the main proxy instead, copy the entries from
-`config/litellm_realtime.yaml` into `mobipick_gpt/config/litellm_config.yaml`
-and use `--litellm-url http://127.0.0.1:4000/v1`.
+The main Mobipick proxy (GUI button LiteLLM, port 4000) already serves
+`gpt-realtime-2.1-mini` and `gpt-realtime-2.1`. For a standalone proxy with
+only these aliases, run `scripts/run_litellm_realtime.sh` (port 4001,
+`config/litellm_realtime.yaml`) and add `--litellm-url http://127.0.0.1:4001/v1`.
 
 ### 3. Talk
 
 ```bash
-scripts/realtime_voice_demo --text --litellm-url http://127.0.0.1:4001/v1      # typed chat, checks the route
-scripts/realtime_voice_demo --litellm-url http://127.0.0.1:4001/v1 --input ALU1 --output Pebble --meter
+scripts/realtime_voice_demo --text                                   # typed chat, checks the route
+scripts/realtime_voice_demo --input ALU1 --output Pebble --meter
 ```
 
-Useful flags:
+Useful flags (demo and voice agent):
 
+- `--voice cedar|echo`
 - `--aec webrtc|speex|nlms|none` and `--gate smart|half|full`
 - `--vad semantic_vad|server_vad` and `--vad-eagerness low|medium|high|auto`
 - `--model gpt-realtime-2.1` for the full model (default `gpt-realtime-2.1-mini`)
 - `--backend openai` to skip LiteLLM
+- `--language ''` to auto-detect the transcript language (default `en`)
 - `--debug-dir DIR` saves `mic.wav`, `reference.wav`, `aec_out.wav` and
   `sent.wav` on exit. `sent.wav` is exactly what the API heard.
 - `--meter` prints mic, AEC and reference levels, ERLE, gate state and the
@@ -160,12 +198,13 @@ Useful flags:
 
 The session asks the API for `far_field` input noise reduction and
 `gpt-4o-mini-transcribe` user transcripts. Semantic VAD with
-`interrupt_response` handles turn-taking.
+`interrupt_response` handles turn-taking. Barge-in stops playback and
+truncates the answer to what was actually heard.
 
 ## Tests
 
 ```bash
-python3 -m pytest          # 29 tests, no audio hardware or network needed
+python3 -m pytest          # 30 tests, no audio hardware or network needed
 ```
 
 The tests simulate a reverberant room with real Piper speech
@@ -177,28 +216,34 @@ and Python 3.8 (Mobipick Noetic image).
 ```
 src/realtime_api/
   echo_cancel.py      AEC backends (webrtc/speex/nlms), GCC-PHAT delay estimate, ERLE
-  duplex_audio.py     DuplexAudioEngine, ReferenceTimeline, PlaybackQueue, EchoGate
+  duplex_audio.py     DuplexAudioEngine, ReferenceTimeline, ClockTracker, PlaybackQueue, EchoGate
   realtime_client.py  websocket-client Realtime API client (GA + beta events), LiteLLM/OpenAI endpoints
-  voice_session.py    glue: mic -> API, API audio -> speaker, barge-in, tool calls
+  voice_session.py    glue: mic -> API, API audio -> speaker, barge-in, tool calls, say() and note()
+  ros_bridge.py       std_msgs String/Bool topics over rosbridge (roslibpy)
+  mobipick_prompt.py  voice prompt with the mobipick_gpt chatbot facts filled in
+  app.py              shared command line, engine setup, echo delay cache
   audio_utils.py      resampling, framing, wav io
 scripts/
+  realtime_voice_agent    Mobipick voice agent (ROS over rosbridge)
+  run_voice_agent.sh      host launcher used by the GUI button (venv, keys, rosbridge discovery)
+  install_host.sh         one-time host venv
+  voice_sampler           hear the robot voices
   realtime_voice_demo     standalone demo (voice / --text / --echo-test)
   aec_loopback_test       hardware AEC benchmark across backends
-  run_litellm_realtime.sh LiteLLM proxy with the realtime aliases
+  run_litellm_realtime.sh standalone LiteLLM proxy with the realtime aliases
 config/litellm_realtime.yaml
 ```
 
-## Next steps
+## Notes
 
-- **mobipick_gpt agent.** `VoiceSession` has no ROS dependency. A ROS node
-  (or a Pi harness tool) would pass an `on_tool_call` that forwards
-  `send_robot_command(command)` to the mobipick_gpt router, the way
-  `human_says` does today. It would publish the user and robot transcripts
-  and report task progress back with `client.send_text(..., respond=True)`.
-- **Other voices on the same speaker.** If `piper_tts_node` also speaks,
-  send its audio through `DuplexAudioEngine.play()` so the canceller knows
-  it. As a fallback, call `engine.set_external_speaking(True)` while it
-  talks, which treats that time like `half` mode.
+- **Other voices on the same speaker.** Audio played by another process
+  (for example `piper_tts_node` through `aplay`) is not in the canceller's
+  reference. Send it through `/realtime/say` or `DuplexAudioEngine.play()`
+  instead. As a fallback, `engine.set_external_speaking(True)` treats that
+  time like `half` mode.
 - **WebRTC in the robot container.** livekit needs Python ≥ 3.9. Run the
-  voice process on the host or in a small 22.04+ container next to the
-  Noetic one, or use `--aec speex` or `--aec nlms` inside Noetic.
+  voice agent on the host or in a small 22.04+ container next to the Noetic
+  one, or use `--aec speex` or `--aec nlms` inside Noetic.
+- **While a task runs**, mobipick_gpt takes only answers to its own
+  questions. The voice agent says it is still busy instead of accepting a
+  new order it could not start.
