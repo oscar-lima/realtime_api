@@ -1,0 +1,8 @@
+# pip install -r requirements.txt
+numpy
+scipy
+sounddevice
+websocket-client
+# WebRTC AEC3 echo canceller (best backend); needs Python >= 3.9.
+# Without it the Speex backend (apt install libspeexdsp1) or numpy NLMS is used.
+livekit; python_version >= "3.9"

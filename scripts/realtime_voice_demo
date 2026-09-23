@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Talk to the robot through the OpenAI Realtime API (standalone, no ROS).
+
+The robot's answer is played through the speaker by the same process that
+captures the microphone, so its own voice is cancelled (WebRTC AEC3 /
+Speex / NLMS) and gated before any audio goes back to the API.
+
+Modes:
+  (default)      full voice conversation
+  --text         type messages, get text answers (checks the API route only)
+  --echo-test    no network: play a sample robot sentence and report what the
+                 echo canceller + gate would have sent upstream
+
+Examples:
+  realtime_voice_demo --list-devices
+  realtime_voice_demo --echo-test --output Pebble --input ALU1
+  realtime_voice_demo --text
+  realtime_voice_demo --input ALU1 --output Pebble
+  realtime_voice_demo --backend openai --model gpt-realtime-2.1-mini
+"""
+
+import argparse
+import logging
+import os
+import signal
+import sys
+import threading
+import time
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+from realtime_api.audio_utils import dbfs, read_wav_mono, write_wav_mono  # noqa: E402
+from realtime_api.duplex_audio import FRAME, PROC_RATE, DuplexAudioEngine  # noqa: E402
+from realtime_api.echo_cancel import available_backends  # noqa: E402
+from realtime_api.realtime_client import RealtimeClient, build_session, resolve_endpoint  # noqa: E402
+from realtime_api.voice_session import DEFAULT_INSTRUCTIONS, ROBOT_COMMAND_TOOL, VoiceSession  # noqa: E402
+
+DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "test", "data")
+_LOG = logging.getLogger("realtime_voice_demo")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--list-devices", action="store_true", help="list audio devices and AEC backends")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--text", action="store_true", help="text-only chat over the realtime API")
+    mode.add_argument("--echo-test", action="store_true", help="offline echo test, no network")
+
+    api = p.add_argument_group("api")
+    api.add_argument("--backend", choices=["litellm", "openai"], default="litellm")
+    api.add_argument("--model", default=os.environ.get("REALTIME_MODEL", "gpt-realtime-2.1-mini"),
+                     help="LiteLLM alias or OpenAI model id")
+    api.add_argument("--litellm-url", default="", help="default $LITELLM_BASE_URL or http://127.0.0.1:4000/v1")
+    api.add_argument("--api-key", default="", help="default $LITELLM_API_KEY / $OPENAI_API_KEY or key files")
+    api.add_argument("--voice", default="marin")
+    api.add_argument("--vad", choices=["semantic_vad", "server_vad"], default="semantic_vad")
+    api.add_argument("--vad-eagerness", choices=["low", "medium", "high", "auto"], default="auto")
+    api.add_argument("--instructions-file", default="")
+    api.add_argument("--no-tools", action="store_true", help="do not offer send_robot_command")
+
+    audio = p.add_argument_group("audio")
+    audio.add_argument("--input", default=os.environ.get("REALTIME_INPUT_DEVICE"),
+                       help="mic index or name substring (e.g. ALU1)")
+    audio.add_argument("--output", default=os.environ.get("REALTIME_OUTPUT_DEVICE"),
+                       help="speaker index or name substring (e.g. Pebble)")
+    audio.add_argument("--aec", default="auto", choices=["auto", "webrtc", "speex", "nlms", "none"])
+    audio.add_argument("--gate", default="smart", choices=["smart", "half", "full"],
+                       help="smart: pass user speech over the robot (barge-in), half: mute mic while "
+                            "the robot talks, full: trust the AEC completely")
+    audio.add_argument("--echo-delay-ms", type=float, default=0.0)
+    audio.add_argument("--lead-ms", type=float, default=40.0)
+    audio.add_argument("--no-calibrate", action="store_true", help="skip the startup noise-burst calibration")
+    audio.add_argument("--output-gain", type=float, default=1.0)
+    audio.add_argument("--mic-gain", type=float, default=1.0)
+    audio.add_argument("--debug-dir", default="", help="save mic/reference/aec/sent wavs here on exit")
+    audio.add_argument("--meter", action="store_true", help="print audio levels every 2 s")
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p.parse_args()
+
+
+def make_engine(args: argparse.Namespace) -> DuplexAudioEngine:
+    engine = DuplexAudioEngine(
+        input_device=args.input, output_device=args.output, aec_backend=args.aec, gate_mode=args.gate,
+        echo_delay_ms=args.echo_delay_ms, ref_lead_ms=args.lead_ms, output_gain=args.output_gain,
+        mic_gain=args.mic_gain, record_debug=bool(args.debug_dir),
+    )
+    engine.start()
+    if not args.no_calibrate:
+        print("calibrating echo path (short noise bursts) ...", flush=True)
+        lag, conf = engine.calibrate()
+        print(f"  echo delay {engine.echo_delay_s * 1000:.0f} ms (lag {lag:.0f} ms, confidence {conf:.0f})"
+              + ("" if conf >= 8 else "  <- weak echo; is the speaker on and loud enough?"), flush=True)
+    return engine
+
+
+def save_debug(engine: DuplexAudioEngine, directory: str) -> None:
+    if not directory or not engine.debug_mic:
+        return
+    os.makedirs(directory, exist_ok=True)
+    for name, frames in (("mic", engine.debug_mic), ("reference", engine.debug_ref),
+                         ("aec_out", engine.debug_out), ("sent", engine.debug_sent)):
+        write_wav_mono(os.path.join(directory, f"{name}.wav"), np.concatenate(frames), PROC_RATE)
+    print(f"debug wavs written to {directory}")
+
+
+def start_meter(engine: DuplexAudioEngine, stop: threading.Event) -> None:
+    def loop() -> None:
+        while not stop.wait(2.0):
+            s = engine.stats
+            delay = engine.last_delay
+            print(f"  [mic {s['mic_db']:6.1f} dBFS | aec out {s['out_db']:6.1f} | ref {s['ref_db']:6.1f} | "
+                  f"ERLE {s['erle_db']:5.1f} dB | gate {'open' if s.get('gate_open') else 'shut'}"
+                  + (f" | echo lag {delay[0]:.0f} ms" if delay else "") + "]", flush=True)
+    threading.Thread(target=loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------- modes
+
+
+def run_echo_test(args: argparse.Namespace) -> int:
+    """Play robot speech, count how much of it would have reached the API."""
+    engine = make_engine(args)
+    engine.record_debug = True
+    sent_frames = []
+    engine.add_frame_callback(lambda frame, info: sent_frames.append((frame, info)))
+    voice, _ = read_wav_mono(os.path.join(DATA, "robot_voice_16k.wav"), PROC_RATE)
+    mark = len(engine.debug_mic)
+    time.sleep(0.5)
+    sent_frames.clear()
+    print(f"playing {voice.size / PROC_RATE:.1f} s of robot speech; stay quiet ...", flush=True)
+    engine.play(voice, PROC_RATE, "echo-test")
+    while engine.is_playing():
+        time.sleep(0.1)
+    time.sleep(0.8)
+    engine.stop()
+    mic = np.concatenate(engine.debug_mic[mark:])
+    out = np.concatenate(engine.debug_out[mark:])
+    ref = np.concatenate(engine.debug_ref[mark:])
+    on = np.array([np.sqrt(np.mean(ref[i:i + FRAME].astype(float) ** 2)) > 100 for i in range(0, ref.size, FRAME)])
+    echo = np.repeat(on, FRAME)[: mic.size]
+    passed = sum(1 for f, info in sent_frames if info["echo_active"] and np.any(f))
+    total = sum(1 for _, info in sent_frames if info["echo_active"])
+    erle = dbfs(mic[echo]) - dbfs(out[echo]) if echo.any() else float("nan")
+    print()
+    print(f"AEC backend        : {engine.aec.name}   gate: {engine.gate.mode}")
+    print(f"mic during speech  : {dbfs(mic[echo]):.1f} dBFS   after AEC: {dbfs(out[echo]):.1f} dBFS")
+    print(f"echo removed (ERLE): {erle:.1f} dB")
+    print(f"frames sent upstream while the robot spoke: {passed}/{total} "
+          f"({100.0 * passed / max(total, 1):.1f}%, 0% = the API never hears the robot)")
+    if args.debug_dir:
+        save_debug(engine, args.debug_dir)
+    return 0
+
+
+def run_text(args: argparse.Namespace) -> int:
+    url, token = resolve_endpoint(args.backend, args.model, args.litellm_url, args.api_key)
+    client = RealtimeClient(url, token)
+    session = build_session(load_instructions(args), tools=None if args.no_tools else [ROBOT_COMMAND_TOOL],
+                            audio=False)
+    done = threading.Event()
+    VoiceSession(client, None,
+                 on_assistant_delta=lambda d: print(d, end="", flush=True),
+                 on_assistant_text=lambda t: print(),
+                 on_tool_call=dry_tool)
+    def on_done(event: dict) -> None:
+        print_usage(event)
+        outputs = (event.get("response") or {}).get("output", [])
+        if not any(o.get("type") == "function_call" for o in outputs):
+            done.set()  # a tool call is followed by a second response
+
+    client.on("response.done", on_done)
+    client.on("error", lambda e: done.set())
+    client.on("connection.closed", lambda e: done.set())
+    if not connect(client, url, session):
+        return 1
+    print("connected. Type a message (Ctrl-D to quit).")
+    try:
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            done.clear()
+            print("robot> ", end="", flush=True)
+            client.send_text(line.strip())
+            done.wait(60)
+            if client.closed.is_set():
+                return 1
+    finally:
+        client.close()
+    return 0
+
+
+def run_voice(args: argparse.Namespace) -> int:
+    url, token = resolve_endpoint(args.backend, args.model, args.litellm_url, args.api_key)
+    engine = make_engine(args)
+    client = RealtimeClient(url, token)
+    session = build_session(load_instructions(args), voice=args.voice,
+                            tools=None if args.no_tools else [ROBOT_COMMAND_TOOL],
+                            vad=args.vad, vad_eagerness=args.vad_eagerness)
+    state = {"speaking": False}
+
+    def assistant_delta(delta: str) -> None:
+        if not state["speaking"]:
+            print("robot> ", end="", flush=True)
+            state["speaking"] = True
+        print(delta, end="", flush=True)
+
+    def assistant_done(_: str) -> None:
+        state["speaking"] = False
+        print(flush=True)
+
+    VoiceSession(client, engine,
+                 on_user_text=lambda t: print(f"you>   {t}", flush=True) if t else None,
+                 on_assistant_delta=assistant_delta, on_assistant_text=assistant_done,
+                 on_tool_call=dry_tool)
+    client.on("input_audio_buffer.speech_started", lambda e: _LOG.debug("user speech started"))
+    client.on("response.done", print_usage if args.verbose else (lambda e: None))
+    stop = threading.Event()
+    client.on("connection.closed", lambda e: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    try:
+        if not connect(client, url, session):
+            return 1
+        print("listening. Talk to the robot (Ctrl-C to quit).", flush=True)
+        if args.meter:
+            start_meter(engine, stop)
+        stop.wait()
+    finally:
+        client.close()
+        engine.stop()
+        save_debug(engine, args.debug_dir)
+    return 0
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def connect(client: RealtimeClient, url: str, session: dict) -> bool:
+    print(f"connecting to {url} ...", flush=True)
+    try:
+        client.connect(session)
+    except Exception as exc:  # handshake refused, proxy down, bad key, ...
+        print(f"could not connect: {exc}".split(" -+-+- ")[0])
+        if "401" in str(exc) or "403" in str(exc):
+            print("check the key: LiteLLM needs its master key ($LITELLM_API_KEY or "
+                  "amenable_ws/src/litellm_master_key), OpenAI direct needs $OPENAI_API_KEY")
+        return False
+    if not client.wait_ready(15):
+        print(f"session not ready: {client.last_error or 'connection closed'}")
+        client.close()
+        return False
+    return True
+
+
+def load_instructions(args: argparse.Namespace) -> str:
+    if args.instructions_file:
+        with open(args.instructions_file) as handle:
+            return handle.read()
+    return DEFAULT_INSTRUCTIONS
+
+
+def dry_tool(name: str, arguments: dict) -> dict:
+    print(f"\n  [tool] {name}({arguments})  -> dry run, mobipick_gpt not connected", flush=True)
+    return {"status": "accepted", "note": "dry run: the task planner is not connected yet, "
+            "tell the user the command was understood"}
+
+
+def print_usage(event: dict) -> None:
+    usage = (event.get("response") or {}).get("usage") or {}
+    status = (event.get("response") or {}).get("status")
+    if status and status != "completed":
+        print(f"  [response {status}: {(event.get('response') or {}).get('status_details')}]", flush=True)
+    if usage:
+        print(f"  [tokens in {usage.get('input_tokens')} out {usage.get('output_tokens')}]", flush=True)
+
+
+def main() -> int:
+    args = parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s %(name)s: %(message)s")
+    if args.list_devices:
+        import sounddevice as sd
+
+        print(sd.query_devices())
+        print("\nAEC backends:", available_backends())
+        return 0
+    if args.echo_test:
+        return run_echo_test(args)
+    if args.text:
+        return run_text(args)
+    return run_voice(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

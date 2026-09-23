@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>realtime_api</name>
+  <version>0.0.1</version>
+  <description>Speech-to-speech conversation with the robot through the OpenAI Realtime API (via LiteLLM), with acoustic echo cancellation so the robot never hears itself.</description>
+
+  <maintainer email="oscar.lima@dfki.de">Oscar Lima</maintainer>
+
+  <license>BSD</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-websocket</exec_depend>
+  <exec_depend>libspeexdsp1</exec_depend>
+
+</package>

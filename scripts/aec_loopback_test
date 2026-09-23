@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Measure echo cancellation on the real speaker + microphone.
+
+Plays robot speech through the loudspeaker while recording the microphone
+(no human needed), then replays the same recording through every available
+AEC backend and prints how much of the robot voice each one removes (ERLE)
+and whether the echo gate stays shut. Optionally mixes a recorded "user"
+utterance digitally into the mic signal to check that a person talking over
+the robot still gets through (double talk / barge-in).
+
+Examples:
+  aec_loopback_test --list-devices
+  aec_loopback_test --input "ALU1" --output "Pebble"
+  aec_loopback_test --output-gain 2.0 --save-dir /tmp/aec_test
+  aec_loopback_test --replay /tmp/aec_test     # re-analyse a saved recording
+"""
+
+import argparse
+import logging
+import os
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+from realtime_api.audio_utils import dbfs, read_wav_mono, write_wav_mono  # noqa: E402
+from realtime_api.duplex_audio import (  # noqa: E402
+    ECHO_ACTIVE_RMS, ECHO_TAIL_S, FRAME, PROC_RATE, DuplexAudioEngine, EchoGate, speaker_envelope,
+)
+from realtime_api.echo_cancel import BACKENDS, available_backends, erle_db, make_echo_canceller  # noqa: E402
+
+DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "test", "data")
+
+
+def record(args: argparse.Namespace) -> "tuple[np.ndarray, np.ndarray]":
+    """Play the robot voice and return (raw mic, aligned reference) at 16 kHz."""
+    voice, _ = read_wav_mono(args.wav, PROC_RATE)
+    engine = DuplexAudioEngine(
+        input_device=args.input, output_device=args.output, aec_backend="none", gate_mode="full",
+        echo_delay_ms=args.echo_delay_ms, ref_lead_ms=args.lead_ms, output_gain=args.output_gain,
+        mic_gain=args.mic_gain, track_delay=False, record_debug=False,
+    )
+    engine.start()
+    if not args.no_calibrate:
+        lag, conf = engine.calibrate()
+        print(f"calibration: echo lag {lag:.1f} ms (confidence {conf:.0f}) -> echo delay "
+              f"{engine.echo_delay_s * 1000:.0f} ms, reference lead {engine.ref_lead_s * 1000:.0f} ms")
+    engine.record_debug = True
+    time.sleep(1.0)  # room noise only
+    engine.play(voice, PROC_RATE, "voice")
+    print(f"playing {voice.size / PROC_RATE:.1f} s of robot speech ...")
+    while engine.is_playing():
+        time.sleep(0.1)
+    time.sleep(1.0)
+    engine.record_debug = False
+    engine.stop()
+    return np.concatenate(engine.debug_mic), np.concatenate(engine.debug_ref)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--list-devices", action="store_true")
+    p.add_argument("--input", default=None, help="mic device index or name substring")
+    p.add_argument("--output", default=None, help="speaker device index or name substring")
+    p.add_argument("--wav", default=os.path.join(DATA, "robot_voice_16k.wav"), help="robot speech to play")
+    p.add_argument("--near-wav", default=os.path.join(DATA, "user_voice_16k.wav"),
+                   help="user speech mixed digitally into the mic recording ('' to skip)")
+    p.add_argument("--near-db", type=float, default=0.0,
+                   help="user level relative to the recorded echo level (dB)")
+    p.add_argument("--output-gain", type=float, default=1.0)
+    p.add_argument("--mic-gain", type=float, default=1.0)
+    p.add_argument("--lead-ms", type=float, default=40.0)
+    p.add_argument("--echo-delay-ms", type=float, default=0.0)
+    p.add_argument("--no-calibrate", action="store_true")
+    p.add_argument("--save-dir", default="", help="write mic/ref/output wavs here")
+    p.add_argument("--replay", default="", help="analyse mic_raw.wav + reference.wav from an earlier --save-dir")
+    args = p.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if args.list_devices:
+        import sounddevice as sd
+
+        print(sd.query_devices())
+        return 0
+
+    print("AEC backends:", available_backends())
+    if args.replay:
+        mic, _ = read_wav_mono(os.path.join(args.replay, "mic_raw.wav"), PROC_RATE)
+        ref, _ = read_wav_mono(os.path.join(args.replay, "reference.wav"), PROC_RATE)
+    else:
+        mic, ref = record(args)
+    ref_on = np.array([np.sqrt(np.mean(ref[i:i + FRAME].astype(float) ** 2)) > 100 for i in range(0, ref.size, FRAME)])
+    noise = mic[: int(0.8 * PROC_RATE)]
+    echo_frames = np.repeat(ref_on, FRAME)[: mic.size]
+    print(f"levels: room noise {dbfs(noise):.1f} dBFS, mic during robot speech {dbfs(mic[echo_frames]):.1f} dBFS, "
+          f"reference {dbfs(ref[echo_frames]):.1f} dBFS")
+    if dbfs(mic[echo_frames]) - dbfs(noise) < 10:
+        print("WARNING: the echo is barely above the room noise; raise --output-gain or speaker volume "
+              "for a meaningful test")
+
+    # optional digitally mixed near-end speech, placed in the middle of the robot speech
+    near_mask = np.zeros(mic.size, dtype=bool)
+    mic_test = mic.astype(np.float64)
+    near = np.zeros(mic.size)
+    if args.near_wav:
+        nv, _ = read_wav_mono(args.near_wav, PROC_RATE)
+        start = int(np.argmax(echo_frames)) + int(4 * PROC_RATE)
+        nv = nv[: max(0, mic.size - start)].astype(np.float64)
+        echo_rms = np.sqrt(np.mean(mic[echo_frames].astype(float) ** 2))
+        nv *= echo_rms * 10 ** (args.near_db / 20) / (np.sqrt(np.mean(nv ** 2)) + 1e-9)
+        near[start:start + nv.size] = nv
+        near_mask[start:start + nv.size] = np.convolve(np.abs(nv), np.ones(800) / 800, "same") > 0.1 * np.sqrt(np.mean(nv ** 2))
+        mic_test = mic_test + near
+    mic_test = np.clip(np.rint(mic_test), -32768, 32767).astype(np.int16)
+    echo_only = echo_frames & ~(np.convolve(near_mask, np.ones(8000), "same") > 0)
+
+    if args.save_dir:
+        os.makedirs(args.save_dir, exist_ok=True)
+        write_wav_mono(os.path.join(args.save_dir, "mic_raw.wav"), mic, PROC_RATE)
+        write_wav_mono(os.path.join(args.save_dir, "mic_with_user.wav"), mic_test, PROC_RATE)
+        write_wav_mono(os.path.join(args.save_dir, "reference.wav"), ref, PROC_RATE)
+
+    print()
+    print(f"{'backend':8s} {'ERLE echo-only':>15s} {'gate leak':>10s} {'user kept':>10s} {'user corr':>10s}")
+    for name in BACKENDS:
+        try:
+            aec = make_echo_canceller(name, PROC_RATE)
+        except Exception as exc:
+            print(f"{name:8s} unavailable: {exc}")
+            continue
+        gate = EchoGate("smart")
+        n = (mic_test.size // FRAME) * FRAME
+        out = np.zeros(n, dtype=np.int16)
+        sent = np.zeros(n, dtype=np.int16)
+        for i in range(0, n, FRAME):
+            o = aec.process(mic_test[i:i + FRAME], ref[i:i + FRAME])
+            out[i:i + FRAME] = o
+            env = speaker_envelope(ref[max(0, i - int(ECHO_TAIL_S * PROC_RATE)): i + FRAME])
+            env_db = 20 * np.log10(max(env, 1e-3) / 32768.0)
+            sent[i:i + FRAME] = np.concatenate(gate.process(o, env > ECHO_ACTIVE_RMS, env_db))[-FRAME:]
+        aec.close()
+        eo = echo_only[:n]
+        erle = erle_db(mic_test[:n][eo], out[eo])
+        leak = float(np.mean(np.abs(sent[eo]) > 0)) * 100.0
+        kept, corr = float("nan"), float("nan")
+        if near_mask.any():
+            nm = near_mask[:n]
+            kept = float(np.mean([np.any(sent[i:i + FRAME] != 0) for i in np.nonzero(nm)[0][::FRAME]])) * 100.0
+            o, r = sent[nm].astype(float), near[:n][nm]
+            corr = max(np.dot(o[l:], r[: r.size - l]) / np.sqrt(np.dot(o, o) * np.dot(r, r) + 1e-9)
+                       for l in range(0, 480, 16))
+        print(f"{name:8s} {erle:13.1f} dB {leak:9.1f}% {kept:9.1f}% {corr:10.2f}")
+        if args.save_dir:
+            write_wav_mono(os.path.join(args.save_dir, f"out_{name}.wav"), out, PROC_RATE)
+            write_wav_mono(os.path.join(args.save_dir, f"sent_{name}.wav"), sent, PROC_RATE)
+    print()
+    print("ERLE: how much quieter the robot voice is after cancellation (>25 dB good, >40 dB great)")
+    print("gate leak: % of robot-only speech frames forwarded upstream by the smart gate (0% ideal)")
+    print("user kept / corr: % of user-speech frames forwarded, and similarity to the clean user voice")
+    if args.save_dir:
+        print(f"wavs written to {args.save_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

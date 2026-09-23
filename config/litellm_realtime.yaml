@@ -1,0 +1,25 @@
+# LiteLLM model aliases for the OpenAI Realtime API.
+#
+# Standalone use: scripts/run_litellm_realtime.sh starts a proxy with only
+# these entries. To serve them from the main Mobipick proxy instead, copy the
+# model_list entries below into mobipick_gpt/config/litellm_config.yaml.
+#
+# Clients open ws://<host>:<port>/v1/realtime?model=<model_name> with
+# "Authorization: Bearer <LiteLLM master key>". LiteLLM >= 1.102 bridges the
+# GA realtime protocol unchanged (no OpenAI-Beta header).
+model_list:
+  - model_name: gpt-realtime-2.1-mini
+    litellm_params:
+      model: openai/gpt-realtime-2.1-mini
+      api_key: os.environ/OPENAI_API_KEY
+    model_info:
+      mode: realtime
+  - model_name: gpt-realtime-2.1
+    litellm_params:
+      model: openai/gpt-realtime-2.1
+      api_key: os.environ/OPENAI_API_KEY
+    model_info:
+      mode: realtime
+
+litellm_settings:
+  drop_params: true
