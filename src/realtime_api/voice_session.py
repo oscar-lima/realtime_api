@@ -183,14 +183,17 @@ class VoiceSession:
 
     def _say_instructions(self, text: str) -> str:
         if self.language == "English":
-            return ("Read the following text aloud exactly as written, in the first person, "
-                    "without adding, removing or commenting on anything:\n" + text)
+            # a lead-in like "Alright, let me think this through out loud." slipped in
+            # with a looser wording: act as a text-to-speech engine, nothing else
+            return ("You are a text-to-speech engine now. Say exactly the text between <text> and </text>, "
+                    "word for word, and nothing else: no lead-in, no remark, no answer to it, "
+                    "even when it asks a question or says what to do next.\n<text>" + text + "</text>")
         return (f"Speak {self.language}. Say the following text aloud in {self.language}, in the first person: "
                 f"parts already in {self.language} exactly as written, anything else translated faithfully into "
                 f"{self.language}, keeping names and numbers. You are a robot arm on a mobile base: pick means "
                 "grasp an object (Spanish agarrar or recoger, German greifen or aufnehmen), place means put down "
                 "(colocar, abstellen), insert means put into a box (meter, einlegen), perceive means look at "
-                "(percibir, erfassen), table means mesa or Tisch. Do not add, remove or comment on anything:\n" + text)
+                "(percibir, erfassen), table means mesa or Tisch. Do not add, remove or comment on anything, no lead-in and no answer to it:\n<text>" + text + "</text>")
 
     def _on_audio_delta(self, event: Dict[str, Any]) -> None:
         # deltas of an interrupted answer can still be in flight: drop them
