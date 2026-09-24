@@ -105,3 +105,10 @@ def test_yes_with_a_new_wording_confirms_the_new_one(rva):
     talk(agent, "Bitte den Cola herbringen.")
     assert talk(agent, "ja, bring die Cola zum Tisch 2") == [("say", "Hast du gesagt: bring die Cola zum Tisch 2?")]
     assert talk(agent, "Sí, agarra la gelatina.")[0] == ("say", "¿Dijiste: agarra la gelatina?")
+
+
+def test_rejected_command_stays_rejected_after_a_remark(rva):
+    agent = make_agent(rva)
+    talk(agent, "Bot")
+    assert talk(agent, "No, it's the real-time API from OpenAI.") == [("pass", "it's the real-time API from OpenAI.")]
+    assert talk(agent, "yes") == [("pass", "yes")]  # nothing pending any more: "Bot" is not sent
