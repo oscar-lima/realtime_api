@@ -57,8 +57,10 @@ def test_commands_are_confirmed_in_the_language_spoken(rva):
 
 def test_chat_questions_answers_and_stop_pass_at_once(rva):
     agent = make_agent(rva)
-    for text in ["who built you?", "¿quién te construyó?", "Wer hat dich gebaut?", "table 2", "yes", "stop", "para"]:
+    for text in ["who built you?", "¿quién te construyó?", "Wer hat dich gebaut?", "table 2", "yes", "stop"]:
         assert talk(agent, text) == [("pass", text)]
+    assert talk(agent, "cancela") == [("pass", "stop (cancela)")]
+    assert talk(agent, "Stopp") == [("pass", "stop (Stopp)")]
 
 
 def test_misheard_english_verb_in_spanish_is_no_command(rva):

@@ -193,6 +193,9 @@ def is_command(text: str, language: str = "en") -> bool:
     return any(r.match(w) for w in words_of(text) for r in patterns)
 
 
+ENGLISH_STOPS = {"stop", "stopped", "stopping", "cancel", "cancelled", "canceled", "abort", "halt", "freeze"}
+
+
 def is_stop(text: str) -> bool:
     words = words_of(text)
     # first or last word only: "para" is also Spanish for "for"
@@ -319,7 +322,9 @@ class VoiceAgent:
         """
         if is_stop(text):
             self._pending = ""
-            self._pass_on(text)
+            # the planner misread a lone "cancela" as unclear: give it the English word too
+            english = all(STOP_RE.match(w) is None or w in ENGLISH_STOPS for w in words_of(text))
+            self._pass_on(text if english else f"stop ({text})")
             return
         pending = self._pending if time.monotonic() - self._pending_at < CONFIRM_TIMEOUT_S else ""
         if self._pending and not pending:
