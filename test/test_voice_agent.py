@@ -89,7 +89,9 @@ def test_lone_noise_word_asks_again_or_is_confirmed(rva):
     assert talk(agent, "Agarra el azúcar.") == [("say", "¿Dijiste: Agarra el azúcar?")]
     assert talk(agent, "soup") == [("say", "¿Dijiste: Agarra el azúcar?")]  # "sí" misheard: ask again
     assert talk(agent, "sí") == [("pass", "Agarra el azúcar"), ("say", "Vale.")]
-    assert talk(agent, "soup") == [("say", "¿Dijiste: soup?")]  # idle: a lone noun is confirmed
+    assert talk(agent, "soup") == []  # idle: a lone noun is noise, dropped
+    assert talk(agent, "Haha") == []
+    assert talk(agent, "navegar") == [("say", "¿Dijiste: navegar?")]  # a lone verb is still confirmed
 
 
 def test_one_word_answer_to_a_question_of_the_robot_passes(rva):
@@ -109,6 +111,6 @@ def test_yes_with_a_new_wording_confirms_the_new_one(rva):
 
 def test_rejected_command_stays_rejected_after_a_remark(rva):
     agent = make_agent(rva)
-    talk(agent, "Bot")
+    talk(agent, "pick")
     assert talk(agent, "No, it's the real-time API from OpenAI.") == [("pass", "it's the real-time API from OpenAI.")]
-    assert talk(agent, "yes") == [("pass", "yes")]  # nothing pending any more: "Bot" is not sent
+    assert talk(agent, "yes") == [("pass", "yes")]  # nothing pending any more: "pick" is not sent

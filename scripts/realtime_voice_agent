@@ -355,10 +355,15 @@ class VoiceAgent:
             text = rest  # "no, pick the sugar box": confirm the correction
         # A lone word is an answer when the agents just asked something
         # ("table 2", "the coke"); otherwise it is mostly noise heard as a
-        # word ("soup", "navegar") and is confirmed like a command.
+        # word ("soup", "Haha", "Wartość"): dropped, not even confirmed (a
+        # lone verb such as "navegar" is a command and still confirmed).
         answering = self._busy and time.monotonic() - self._asked_at < ANSWER_WINDOW_S
         lone = len(words_of(text)) == 1 and not answering and words_of(text)[0] not in YES_WORDS | NO_WORDS
-        if not is_command(text, self.language) and not lone:
+        if lone and not is_command(text, self.language):
+            self._pending, self._pending_at = pending, self._pending_at
+            self._print(f"  x  ignored lone word: {text}")
+            return
+        if not is_command(text, self.language):
             self._pending, self._pending_at = pending, self._pending_at  # a question does not cancel it
             self._pass_on(text)
             return
