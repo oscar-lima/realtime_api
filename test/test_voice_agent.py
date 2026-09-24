@@ -114,3 +114,15 @@ def test_rejected_command_stays_rejected_after_a_remark(rva):
     talk(agent, "pick")
     assert talk(agent, "No, it's the real-time API from OpenAI.") == [("pass", "it's the real-time API from OpenAI.")]
     assert talk(agent, "yes") == [("pass", "yes")]  # nothing pending any more: "pick" is not sent
+
+
+def test_asking_for_a_language_switches_the_voice(rva):
+    agent = make_agent(rva)
+    talk(agent, "switch german language")
+    assert agent.voice.language == "German"
+    talk(agent, "habla en español por favor")
+    assert agent.voice.language == "Spanish"
+    talk(agent, "Sprich bitte Englisch")
+    assert agent.voice.language == "English"
+    assert rva.requested_language("I speak German at home, where is the ball") == "de"
+    assert rva.requested_language("the German car is on table 2") == ""

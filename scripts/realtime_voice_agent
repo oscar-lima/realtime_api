@@ -168,6 +168,23 @@ def overlaps(text: str, reference: str, share: float = 0.7, min_words: int = 3) 
     return len(words) >= min_words and sum(w in ref for w in words) >= share * len(words)
 
 
+# "switch to German", "habla español", "sprich Englisch": asked for in any language
+SWITCH_RE = re.compile(r"\b(switch|speak|talk|change|use|answer|reply|habla|hablar|cambia|usa|responde|"
+                       r"sprich|sprechen|wechsel|antworte)\w*\b")
+TARGET_LANGUAGE = {"english": "en", "inglés": "en", "ingles": "en", "englisch": "en",
+                   "spanish": "es", "español": "es", "espanol": "es", "castellano": "es", "spanisch": "es",
+                   "german": "de", "alemán": "de", "aleman": "de", "deutsch": "de"}
+
+
+def requested_language(text: str) -> str:
+    """The language the person asks the robot to speak, or ''."""
+    words = words_of(text)
+    if not SWITCH_RE.search(" ".join(words)):
+        return ""
+    targets = [TARGET_LANGUAGE[w] for w in words if w in TARGET_LANGUAGE]
+    return targets[-1] if targets else ""
+
+
 def detect_language(text: str, current: str = "en") -> str:
     """'en', 'es' or 'de' by common words; ``current`` when the words do not tell."""
     words = words_of(text)
@@ -302,7 +319,7 @@ class VoiceAgent:
         if leak_window and any(overlaps(text, said, share=0.8) for _, said in self._said):
             self._print("  x  ignored: my own voice")
             return
-        language = detect_language(text, self.language)
+        language = requested_language(text) or detect_language(text, self.language)
         if language != self.language:
             self._print(f"  ~  language: {LANGUAGE_NAMES[language]}")
             self.language = language
