@@ -140,12 +140,22 @@ LANGUAGE_WORDS = {
     "de": {"der", "die", "das", "und", "ist", "nicht", "ich", "du", "bitte", "zum", "zur", "den", "dem", "ein",
            "eine", "mit", "auf", "tisch", "hallo", "wir", "sprechen", "deutsch", "kannst", "wo", "wer", "was"},
 }
-LANGUAGE_NAMES = {"en": "English", "es": "Spanish", "de": "German"}
+LANGUAGE_WORDS["it"] = {"il", "lo", "gli", "le", "di", "che", "e", "è", "per", "con", "tavolo", "ciao", "voglio",
+                        "puoi", "dove", "cosa", "come", "questo", "quello", "non", "sono", "della", "nel"}
+LANGUAGE_WORDS["fr"] = {"le", "la", "les", "de", "des", "du", "et", "est", "un", "une", "pour", "avec", "table",
+                        "bonjour", "je", "tu", "vous", "où", "quoi", "comment", "ce", "cette", "pas", "sur"}
+LANGUAGE_NAMES = {"en": "English", "es": "Spanish", "de": "German", "it": "Italian", "fr": "French"}
+# --languages: the languages the demo accepts. Utterances confidently in another language, or in a non-Latin
+# script (noise often comes back as Chinese or Russian), are dropped instead of reaching the agents.
+LANGUAGE_SETS = {"en": ["en"], "en,de,es": ["en", "de", "es"], "en,de,es,it,fr": ["en", "de", "es", "it", "fr"]}
+NON_LATIN_RE = re.compile(r"[\u0370-\u03ff\u0400-\u04ff\u0590-\u06ff\u0900-\u0dff\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
 # the bridge's own sentences, per language (its words, not the person's)
 PHRASES = {
     "en": {"confirm": "Did you say: {}?", "yes": "Okay.", "no": "Okay, I ignore it."},
     "es": {"confirm": "¿Dijiste: {}?", "yes": "Vale.", "no": "Vale, lo ignoro."},
     "de": {"confirm": "Hast du gesagt: {}?", "yes": "Okay.", "no": "Okay, ich ignoriere es."},
+    "it": {"confirm": "Hai detto: {}?", "yes": "Va bene.", "no": "Va bene, lo ignoro."},
+    "fr": {"confirm": "Tu as dit : {} ?", "yes": "D'accord.", "no": "D'accord, je l'ignore."},
 }
 CONFIRM_TIMEOUT_S = 20.0
 ANSWER_WINDOW_S = 40.0  # a question of the agents stays open this long for one-word answers
@@ -170,10 +180,12 @@ def overlaps(text: str, reference: str, share: float = 0.7, min_words: int = 3) 
 
 # "switch to German", "habla español", "sprich Englisch": asked for in any language
 SWITCH_RE = re.compile(r"\b(switch|speak|talk|change|use|answer|reply|habla|hablar|cambia|usa|responde|"
-                       r"sprich|sprechen|wechsel|antworte)\w*\b")
+                       r"sprich|sprechen|wechsel|antworte|parla|parlare|parle|parlez)\w*\b")
 TARGET_LANGUAGE = {"english": "en", "inglés": "en", "ingles": "en", "englisch": "en",
                    "spanish": "es", "español": "es", "espanol": "es", "castellano": "es", "spanisch": "es",
-                   "german": "de", "alemán": "de", "aleman": "de", "deutsch": "de"}
+                   "german": "de", "alemán": "de", "aleman": "de", "deutsch": "de",
+                   "italian": "it", "italiano": "it", "italienisch": "it", "french": "fr", "français": "fr",
+                   "francais": "fr", "französisch": "fr", "francés": "fr"}
 
 
 def requested_language(text: str) -> str:
@@ -186,9 +198,9 @@ def requested_language(text: str) -> str:
 
 
 def detect_language(text: str, current: str = "en") -> str:
-    """'en', 'es' or 'de' by common words; ``current`` when the words do not tell."""
+    """'en', 'es', 'de', 'it' or 'fr' by common words; ``current`` when the words do not tell."""
     words = words_of(text)
-    scores = {lang: sum(w in common or bool(ACTION_RE[lang].match(w)) for w in words)
+    scores = {lang: sum(w in common or bool(lang in ACTION_RE and ACTION_RE[lang].match(w)) for w in words)
               for lang, common in LANGUAGE_WORDS.items()}
     if re.search(r"[ñ¿¡áéíóú]", text):
         scores["es"] += 2
@@ -254,6 +266,9 @@ def parse_args() -> argparse.Namespace:
                         "model answers small talk itself and decides what to execute")
     p.add_argument("--no-confirm", action="store_true", default=os.environ.get("REALTIME_CONFIRM", "1") == "0",
                    help="bridge mode: pass utterances on without asking 'Did you say ...?' first")
+    p.add_argument("--languages", choices=sorted(LANGUAGE_SETS), default=os.environ.get("REALTIME_LANGUAGES", "en"),
+                   help="languages the person may use (default en: English only, the transcription is told to "
+                        "expect English); utterances in other languages are ignored")
     p.add_argument("--transcription-hint", default=os.environ.get("REALTIME_TRANSCRIPTION_HINT", TRANSCRIPTION_HINT),
                    help="prompt for the transcription model, e.g. expected object names (default: none)")
     ros.add_argument("--prompt-dir", default=os.environ.get("MOBIPICK_PROMPT_DIR", DEFAULT_PROMPT_DIR))
@@ -276,10 +291,14 @@ class VoiceAgent:
             instructions = BRIDGE_INSTRUCTIONS
         else:
             instructions = build_instructions(args.prompt_dir)
+        self.allowed_languages = LANGUAGE_SETS[args.languages]
+        # one allowed language: tell the transcription model to expect it (it only takes a single hint)
+        transcription_language = args.language or (
+            self.allowed_languages[0] if len(self.allowed_languages) == 1 else "")
         self.session_config = build_session(
             instructions, voice=args.voice,
             tools=None if (args.no_tools or self.bridge) else [MOBIPICK_TOOL],
-            vad=args.vad, vad_eagerness=args.vad_eagerness, language=args.language,
+            vad=args.vad, vad_eagerness=args.vad_eagerness, language=transcription_language,
             create_response=not self.bridge, transcription_model=args.transcription_model,
             transcription_prompt=args.transcription_hint)
         self._speaking = False
@@ -319,7 +338,16 @@ class VoiceAgent:
         if leak_window and any(overlaps(text, said, share=0.8) for _, said in self._said):
             self._print("  x  ignored: my own voice")
             return
-        language = requested_language(text) or detect_language(text, self.language)
+        if NON_LATIN_RE.search(text):
+            self._print("  x  ignored: not in an allowed language (--languages %s)" % self.args.languages)
+            return
+        detected = detect_language(text, self.language)
+        if detected not in self.allowed_languages:
+            self._print(f"  x  ignored: {LANGUAGE_NAMES[detected]} is not allowed (--languages {self.args.languages})")
+            return
+        language = requested_language(text) or detected
+        if language not in self.allowed_languages:
+            language = self.language
         if language != self.language:
             self._print(f"  ~  language: {LANGUAGE_NAMES[language]}")
             self.language = language

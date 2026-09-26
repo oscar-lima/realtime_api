@@ -22,14 +22,15 @@ def rva():
     return module
 
 
-def make_agent(rva):
+def make_agent(rva, languages="en,de,es"):
     agent = rva.VoiceAgent.__new__(rva.VoiceAgent)
+    agent.allowed_languages = rva.LANGUAGE_SETS[languages]
     agent._pending, agent._pending_at, agent._said, agent._busy = "", 0.0, [], False
     agent._speaking, agent._played_until, agent.language, agent.bridge = False, 0.0, "en", True
     agent._asked_at = 0.0
     agent.voice = types.SimpleNamespace(language="English")
     agent.args = types.SimpleNamespace(no_confirm=False, goal_topic="/recognized_speech",
-                                       transcription_hint="")
+                                       transcription_hint="", languages=languages)
     agent.out = []
     agent.ros = types.SimpleNamespace(
         publish=lambda topic, text: topic == "/recognized_speech" and agent.out.append(("pass", text)))
@@ -126,3 +127,24 @@ def test_asking_for_a_language_switches_the_voice(rva):
     assert agent.voice.language == "English"
     assert rva.requested_language("I speak German at home, where is the ball") == "de"
     assert rva.requested_language("the German car is on table 2") == ""
+
+
+def test_english_only_ignores_other_languages_and_scripts(rva):
+    agent = make_agent(rva, languages="en")
+    for noise in ["哈哈哈", "Привет робот", "Donde está la biblioteca?", "Geh zu Tabelle 2, find die KLT dort"]:
+        agent._on_user_text(noise)
+    assert agent.out == []
+    agent._on_user_text("Pick the tennis ball from table 2")
+    assert agent.out == [("say", "Did you say: Pick the tennis ball from table 2?")]
+    assert agent.language == "en"
+
+
+def test_five_languages_allow_italian_and_french(rva):
+    agent = make_agent(rva, languages="en,de,es,it,fr")
+    agent._on_user_text("Dove è il tavolo con la mela?")
+    assert agent.language == "it"
+    agent._on_user_text("Où est la table avec la pomme ?")
+    assert agent.language == "fr"
+    agent.out.clear()
+    agent._on_user_text("哈哈哈")
+    assert agent.out == []

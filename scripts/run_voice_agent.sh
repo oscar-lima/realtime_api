@@ -7,7 +7,8 @@
 # LITELLM_BASE_URL, ROSBRIDGE_URL.
 set -euo pipefail
 
-# The GUI appends its toolbar dropdown as voice_agent:=off|cedar|echo.
+# The GUI appends its toolbar dropdowns as voice_agent:=off|cedar|echo and
+# voice_languages:=en|en_de_es|en_de_es_it_fr (-> --languages en,de,es ...).
 # off keeps the classic workflow: commands come from the GUI or /recognized_speech.
 args=()
 for arg in "$@"; do
@@ -16,6 +17,7 @@ for arg in "$@"; do
       printf 'voice agent is off (toolbar voice_agent=off): send commands through the GUI or /recognized_speech\n'
       exit 0 ;;
     voice_agent:=*) args+=(--voice "${arg#voice_agent:=}") ;;
+    voice_languages:=*) langs="${arg#voice_languages:=}"; args+=(--languages "${langs//_/,}") ;;
     *) args+=("$arg") ;;
   esac
 done
