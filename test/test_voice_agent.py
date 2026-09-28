@@ -5,6 +5,7 @@ import importlib.util
 import os
 import types
 
+import numpy as np
 import pytest
 
 _PATH = os.path.join(os.path.dirname(__file__), "..", "scripts", "realtime_voice_agent")
@@ -227,3 +228,36 @@ def test_a_stop_word_cuts_the_robot_off(rva):
     assert talk(agent, "Stop!") == [("interrupt", "stop word"), ("pass", "Stop!")]
     agent._speaking = False
     assert talk(agent, "stop") == [("pass", "stop")]
+
+
+def test_a_muted_microphone_is_reported_and_said_once_in_a_while(rva):
+    from realtime_api.duplex_audio import MicWatch
+
+    agent = make_agent(rva, languages="en")
+    agent.args.mic_topic, agent.args.dead_mic_say = "/realtime/mic_ok", True
+    agent._mic_said_at = agent._mic_ok_at = float("-inf")
+    agent.engine = types.SimpleNamespace(mic_watch=MicWatch(5.0, clock=lambda: agent.now))
+    agent.ros.publish_bool = lambda topic, value: agent.out.append((topic, value))
+    lines = []
+    agent._print = lines.append
+
+    def tick(seconds, sound):
+        agent.out = []
+        agent.now += seconds
+        if sound:
+            agent.engine.mic_watch.feed(np.ones(160, dtype=np.int16))
+        agent._watch_mic()
+        return agent.out
+
+    assert tick(0.1, False) == [("/realtime/mic_ok", True)]  # the state goes out at once ...
+    assert tick(5.0, False) == [("say", rva.DEAD_MIC_SENTENCE), ("/realtime/mic_ok", False)]
+    assert "WARNING" in lines[-1]
+    assert tick(0.1, False) == []  # ... and then every 10 s
+    assert tick(10.0, False) == [("/realtime/mic_ok", False)]
+    assert tick(1.0, True) == [("/realtime/mic_ok", True)] and "again" in lines[-1]
+    assert tick(6.0, False) == [("/realtime/mic_ok", False)]  # muted again soon: not said again
+    tick(1.0, True)
+    assert ("say", rva.DEAD_MIC_SENTENCE) in tick(300.0, False)  # after 5 min it is said again
+    agent.args.dead_mic_say = False
+    tick(1.0, True)
+    assert tick(400.0, False) == [("/realtime/mic_ok", False)]

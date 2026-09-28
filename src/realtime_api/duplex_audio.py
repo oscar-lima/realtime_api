@@ -332,6 +332,46 @@ class EchoGate:
 
 
 # --------------------------------------------------------------------------
+# dead microphone
+# --------------------------------------------------------------------------
+
+
+class MicWatch:
+    """Notice a microphone that delivers nothing but digital silence (#189).
+
+    A live microphone always carries some noise, even in a quiet room; the
+    KTMICRO ALU1 with its hardware mute button on delivered exact zeros, and
+    the voice agent looked healthy while it heard nothing. ``feed`` takes the
+    raw device samples; no audio at all (a stalled stream) counts as silent too.
+    """
+
+    def __init__(self, dead_after_s: float = 5.0, clock: Callable[[], float] = time.monotonic) -> None:
+        self.dead_after_s = float(dead_after_s)  # 0 turns the watch off
+        self._clock = clock
+        self.reset()
+
+    def reset(self) -> None:
+        self._sound_at = self._clock()
+        self.dead = False
+
+    def feed(self, block: np.ndarray) -> None:
+        if block.size and block.any():
+            self._sound_at = self._clock()
+
+    def silent_s(self) -> float:
+        """Seconds since the microphone last delivered anything but zeros."""
+        return self._clock() - self._sound_at
+
+    def update(self) -> Optional[bool]:
+        """True when the microphone just went dead, False when sound just came back, else None."""
+        dead = self.dead_after_s > 0 and self.silent_s() >= self.dead_after_s
+        if dead == self.dead:
+            return None
+        self.dead = dead
+        return dead
+
+
+# --------------------------------------------------------------------------
 # engine
 # --------------------------------------------------------------------------
 
@@ -417,6 +457,7 @@ class DuplexAudioEngine:
         self._aec_lock = threading.Lock()  # the AEC state is not thread safe
         self._started_at = time.monotonic()
         self._callbacks: List[FrameCallback] = []
+        self.mic_watch = MicWatch()
         self._external_speaking = False
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -468,6 +509,7 @@ class DuplexAudioEngine:
 
         self._running = True
         self._started_at = time.monotonic()
+        self.mic_watch.reset()  # counts from the start of the stream
         self._thread = threading.Thread(target=self._process_loop, name="aec", daemon=True)
         self._thread.start()
         self._out_stream = sd.OutputStream(
@@ -530,6 +572,7 @@ class DuplexAudioEngine:
                 block, t_adc = self._mic_q.get(timeout=0.2)
             except queue.Empty:
                 continue
+            self.mic_watch.feed(block)
             x16 = self._mic_resampler.process(block)
             if self.mic_gain != 1.0:
                 x16 = to_int16(x16.astype(np.float32) * self.mic_gain / 32768.0)

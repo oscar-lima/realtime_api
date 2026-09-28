@@ -150,6 +150,7 @@ waits up to 30 s for it.
 | `/mobipick_gpt/busy` | Bool | in: an order runs, utterances go to it as events |
 | `/realtime/talk` | Bool | in: `--push-to-talk` only: true opens the mic, false closes it |
 | `/realtime/is_speaking` | Bool | out: robot voice audible (mobipick_gpt `listen` waits for it) |
+| `/realtime/mic_ok` | Bool | out: false while the mic delivers only digital silence (muted); on change and every 10 s |
 | `/realtime/user_transcript`, `/realtime/robot_transcript` | String | out: transcripts |
 
 Two modes (`--mode`, or `REALTIME_MODE`):
@@ -209,8 +210,19 @@ arrives on `/realtime/talk`, until false or `--talk-timeout` (15 s); the
 300 ms before the switch go out too. `scripts/push_to_talk` is a keyboard
 switch for a terminal on the host (Enter opens, Enter closes), or
 `rostopic pub -1 /realtime/talk std_msgs/Bool true`. The ALU1's own mute
-button does the same without software, but the agent cannot tell a muted
-mic from a quiet room (#189), and speech started before unmuting is lost.
+button does the same without software, but speech started before unmuting
+is lost, and the dead-mic warning below reports every muted stretch.
+
+**Muted microphone** (#189). A live mic always carries some noise; the ALU1
+with its mute button on delivers exact zeros, and the agent used to look
+healthy while it heard nothing. After `--dead-mic-s` (5 s, 0 turns it off)
+of nothing but zeros, or no audio at all, the agent prints "WARNING: the
+microphone delivers no sound ..." in its log tab, publishes false on
+`/realtime/mic_ok` and says "My microphone is muted or not delivering sound,
+so I cannot hear you." (at most every 5 min; `--no-dead-mic-say` or
+`REALTIME_DEAD_MIC_SAY=0` keeps it silent, e.g. when the mute button is used
+on purpose). "the microphone delivers sound again" and true follow when it
+comes back.
 
 ## Standalone demo
 
@@ -268,7 +280,7 @@ Barge-in stops playback and truncates the answer to what was actually heard.
 ## Tests
 
 ```bash
-python3 -m pytest          # 58 tests, no audio hardware or network needed
+python3 -m pytest          # 60 tests, no audio hardware or network needed
 ```
 
 The tests simulate a reverberant room with real Piper speech
@@ -280,7 +292,7 @@ and Python 3.8 (Mobipick Noetic image).
 ```
 src/realtime_api/
   echo_cancel.py      AEC backends (webrtc/speex/nlms), GCC-PHAT delay estimate, ERLE
-  duplex_audio.py     DuplexAudioEngine, ReferenceTimeline, ClockTracker, PlaybackQueue, EchoGate
+  duplex_audio.py     DuplexAudioEngine, ReferenceTimeline, ClockTracker, PlaybackQueue, EchoGate, MicWatch
   realtime_client.py  websocket-client Realtime API client (GA + beta events), LiteLLM/OpenAI endpoints
   voice_session.py    glue: mic -> API, API audio -> speaker, barge-in, tool calls, say() and note()
   ros_bridge.py       std_msgs String/Bool topics over rosbridge (roslibpy)

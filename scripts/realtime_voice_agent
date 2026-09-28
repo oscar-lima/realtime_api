@@ -30,6 +30,7 @@ Topics
               /realtime/user_transcript     std_msgs/String  what the person said
               /realtime/robot_transcript    std_msgs/String  what the robot said
               /realtime/is_speaking         std_msgs/Bool    robot voice active
+              /realtime/mic_ok              std_msgs/Bool    false: the mic delivers only digital silence (muted)
   subscribes  /speak                        std_msgs/String  said verbatim (mobipick_gpt output)
               /realtime/say                 std_msgs/String  said verbatim (anything else)
               /mobipick_gpt/gpt_debug       std_msgs/String  action progress, kept as silent context
@@ -166,6 +167,11 @@ PHRASES = {
 # question, or whatever it said after it), and at most CONFIRM_MAX_S after the order; other talk keeps it waiting.
 CONFIRM_REPLY_S = 15.0
 CONFIRM_MAX_S = 60.0
+# a mic that delivers only zeros (the ALU1's mute button, #189): said aloud at most this often, since the button may
+# also be used on purpose against room talk
+DEAD_MIC_SENTENCE = "My microphone is muted or not delivering sound, so I cannot hear you."
+DEAD_MIC_SAY_EVERY_S = 300.0
+MIC_OK_EVERY_S = 10.0  # /realtime/mic_ok is repeated this often for late subscribers
 ANSWER_WINDOW_S = 40.0  # a question of the agents stays open this long for one-word answers
 
 
@@ -321,6 +327,12 @@ def parse_args() -> argparse.Namespace:
                    help="send the mic only while true is published on --talk-topic (e.g. scripts/push_to_talk), so "
                         "during a public demo only the operator is heard (default off)")
     ros.add_argument("--talk-topic", default="/realtime/talk")
+    ros.add_argument("--mic-topic", default="/realtime/mic_ok")
+    p.add_argument("--dead-mic-s", type=float, default=float(os.environ.get("REALTIME_DEAD_MIC_S", "5")),
+                   help="warn when the mic delivers only digital silence (muted) this many seconds (0: never)")
+    p.add_argument("--no-dead-mic-say", dest="dead_mic_say", action="store_false",
+                   default=os.environ.get("REALTIME_DEAD_MIC_SAY", "1") != "0",
+                   help="only log and publish a muted mic, do not say it aloud (at most every 5 min otherwise)")
     p.add_argument("--talk-timeout", type=float, default=15.0,
                    help="push-to-talk: the mic closes by itself this many seconds after a true")
     ros.add_argument("--prompt-dir", default=os.environ.get("MOBIPICK_PROMPT_DIR", DEFAULT_PROMPT_DIR))
@@ -354,6 +366,9 @@ class VoiceAgent:
             create_response=not self.bridge, transcription_model=args.transcription_model,
             transcription_prompt=args.transcription_hint, interrupt_response=args.barge_in == "any")
         self._clock = time.monotonic
+        self.engine.mic_watch.dead_after_s = args.dead_mic_s
+        self._mic_said_at = float("-inf")  # when the robot last said that its mic is muted
+        self._mic_ok_at = float("-inf")    # when /realtime/mic_ok was last published
         self._speaking = False
         self._line_open = False
         self._busy = False
@@ -590,12 +605,30 @@ class VoiceAgent:
 
     def _watch_speaking(self) -> None:
         while not self.stop.wait(0.1):
+            self._watch_mic()
             speaking = self.engine.is_playing()
             if speaking != self._speaking:
                 self._speaking = speaking
                 if not speaking:
                     self._played_until = self._clock()
                 self.ros.publish_bool("/realtime/is_speaking", speaking)
+
+    def _watch_mic(self) -> None:
+        """Say so when the microphone delivers only digital silence (a muted ALU1, #189), and when it is back."""
+        watch = self.engine.mic_watch
+        change = watch.update()
+        now = self._clock()
+        if change:
+            self._print(f"  !  WARNING: the microphone delivers no sound for {watch.silent_s():.0f} s, I hear nothing "
+                        "(muted? the ALU1 has a mute button)")
+            if self.args.dead_mic_say and now - self._mic_said_at >= DEAD_MIC_SAY_EVERY_S:
+                self._mic_said_at = now
+                self._say_self(DEAD_MIC_SENTENCE)
+        elif change is False:
+            self._print("  ~  the microphone delivers sound again")
+        if change is not None or now - self._mic_ok_at >= MIC_OK_EVERY_S:
+            self._mic_ok_at = now
+            self.ros.publish_bool(self.args.mic_topic, not watch.dead)
 
     # ---------------------------------------------------------------- run
 

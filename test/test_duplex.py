@@ -102,3 +102,28 @@ def test_speaker_envelope_takes_loudest_frame():
     x = np.zeros(FRAME * 5, dtype=np.int16)
     x[FRAME * 3:FRAME * 4] = 1000
     assert abs(speaker_envelope(x) - 1000) < 1
+
+
+def test_mic_watch_notices_digital_silence_and_its_end():
+    """#189: the ALU1 with its mute button on delivered exact zeros; a live mic always has some noise."""
+    from realtime_api.duplex_audio import MicWatch
+
+    clock = [0.0]
+    watch = MicWatch(dead_after_s=5.0, clock=lambda: clock[0])
+    zeros, noise = np.zeros(160, dtype=np.int16), np.random.default_rng(0).integers(-3, 4, 160).astype(np.int16)
+    for _ in range(40):  # 4 s of zeros: not yet
+        clock[0] += 0.1
+        watch.feed(zeros)
+        assert watch.update() is None
+    for _ in range(11):
+        clock[0] += 0.1
+        watch.feed(zeros)
+    assert watch.update() is True and watch.dead and watch.silent_s() >= 5.0
+    assert watch.update() is None  # said once
+    watch.feed(noise)  # a quiet room still has noise
+    assert watch.update() is False and not watch.dead
+    clock[0] += 6.0  # no audio at all (stalled stream) is silence too
+    assert watch.update() is True
+    off = MicWatch(dead_after_s=0.0, clock=lambda: clock[0])
+    clock[0] += 60.0
+    assert off.update() is None
