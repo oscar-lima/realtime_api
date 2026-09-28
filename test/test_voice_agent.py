@@ -331,3 +331,16 @@ def test_the_agent_exits_when_no_new_session_opens(rva, monkeypatch):
     thread.join(3)
     assert result == [1]
     assert sum("opening a new one" in line for line in agent.lines) == 2 and "exiting" in agent.lines[-1]
+
+
+def test_a_sentence_that_starts_with_a_stop_word_stops_at_once(rva):
+    """#53: "Cancel the inspection on table three" was only steered; with an action verb it was even confirmed."""
+    agent = make_agent(rva, languages="en")
+    agent._speaking = True
+    text = "Cancel and put it back on the table"
+    assert talk(agent, text) == [("interrupt", "stop word"), ("pass", text)]
+    assert rva.is_stop("Cancel the inspection on table three") and rva.is_stop("Stop. Cancel the current task, please")
+    assert not rva.is_stop("Para la mesa dos, coge la coca")      # "para" = "for" at the start of a long sentence
+    assert rva.is_stop("para") and rva.is_stop("please stop")
+    assert not rva.is_stop("Can you cancel that and pick the pear")  # not at the start
+

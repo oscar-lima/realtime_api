@@ -259,10 +259,19 @@ def is_command(text: str, language: str = "en") -> bool:
 ENGLISH_STOPS = {"stop", "stopped", "stopping", "cancel", "cancelled", "canceled", "abort", "halt", "freeze"}
 
 
+# stop words that are also everyday words ("para" = for, "alto" = high): a stop only in a short phrase
+AMBIGUOUS_STOPS = {"para", "alto"}
+
+
 def is_stop(text: str) -> bool:
+    """A stop: a leading stop word at any length ("Cancel the inspection on table three", #53; the planner runner
+    hard-stops on the same rule since mobipick_gpt c6a4599), or a stop word first or last in at most 4 words."""
     words = words_of(text)
-    # first or last word only: "para" is also Spanish for "for"
-    return 0 < len(words) <= 4 and bool(STOP_RE.match(words[0]) or STOP_RE.match(words[-1]))
+    if not words:
+        return False
+    if STOP_RE.match(words[0]) and words[0] not in AMBIGUOUS_STOPS:
+        return True
+    return len(words) <= 4 and bool(STOP_RE.match(words[0]) or STOP_RE.match(words[-1]))
 
 
 def as_command(text: str) -> str:
