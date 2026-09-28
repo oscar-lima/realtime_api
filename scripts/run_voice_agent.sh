@@ -18,6 +18,10 @@ for arg in "$@"; do
       exit 0 ;;
     voice_agent:=*) args+=(--voice "${arg#voice_agent:=}") ;;
     voice_languages:=*) langs="${arg#voice_languages:=}"; args+=(--languages "${langs//_/,}") ;;
+    # for GUI dropdowns not in the button profile yet (#190)
+    voice_push_to_talk:=on) args+=(--push-to-talk) ;;
+    voice_push_to_talk:=*) ;;
+    voice_barge_in:=*) args+=(--barge-in "${arg#voice_barge_in:=}") ;;
     *) args+=("$arg") ;;
   esac
 done

@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Keyboard push-to-talk for the voice agent started with --push-to-talk (#190).
+
+Enter opens the mic (true on /realtime/talk) and the next Enter closes it
+again (false); the voice agent also closes it by itself after its
+--talk-timeout. q + Enter closes the mic and quits. Run it on the host,
+in a terminal next to the microphone:
+
+  scripts/push_to_talk          # rosbridge: $ROSBRIDGE_URL, else the one the voice agent used last
+"""
+
+import argparse
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+from realtime_api.ros_bridge import RosStringBridge, last_rosbridge_url  # noqa: E402
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--rosbridge-url", default=os.environ.get("ROSBRIDGE_URL") or last_rosbridge_url())
+    p.add_argument("--talk-topic", default="/realtime/talk")
+    p.add_argument("--timeout", type=float, default=15.0, help="the voice agent's --talk-timeout")
+    args = p.parse_args()
+    try:
+        ros = RosStringBridge(args.rosbridge_url)
+    except ConnectionError as exc:
+        print(f"{exc}\nIs the voice agent running? Set ROSBRIDGE_URL if it uses another rosbridge.")
+        return 1
+    open_until = 0.0
+    print(f"push-to-talk on {args.talk_topic}: Enter opens the mic, Enter again closes it, q + Enter quits")
+    try:
+        for line in sys.stdin:
+            if line.strip().lower() == "q":
+                break
+            talking = time.monotonic() < open_until
+            ros.publish_bool(args.talk_topic, not talking)
+            open_until = 0.0 if talking else time.monotonic() + args.timeout
+            print("mic closed" if talking else f"mic OPEN, talk now (closes by itself after {args.timeout:.0f} s)")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ros.publish_bool(args.talk_topic, False)
+        ros.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

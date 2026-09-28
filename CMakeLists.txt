@@ -10,6 +10,7 @@ catkin_package()
 catkin_install_python(
   PROGRAMS
     scripts/aec_loopback_test
+    scripts/push_to_talk
     scripts/realtime_voice_agent
     scripts/realtime_voice_demo
     scripts/voice_sampler

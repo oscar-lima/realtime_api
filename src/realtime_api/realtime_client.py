@@ -92,6 +92,7 @@ def build_session(
     language: str = "en",
     create_response: bool = True,
     transcription_prompt: str = "",
+    interrupt_response: bool = True,
 ) -> Dict[str, Any]:
     """GA ``session`` object for ``session.update``.
 
@@ -99,7 +100,9 @@ def build_session(
     (``response.create``, e.g. ``VoiceSession.say``): turn detection and
     transcription still run, which is what a pure speech bridge needs.
     ``transcription_prompt`` lists expected words (object names, places) to
-    steer the transcription model.
+    steer the transcription model. ``interrupt_response=False`` leaves
+    barge-in to the client (``VoiceSession`` with ``barge_in`` loud or stop):
+    the server then does not cancel an answer as soon as it hears speech.
     """
     session: Dict[str, Any] = {
         "type": "realtime",
@@ -109,10 +112,11 @@ def build_session(
     if audio:
         if vad == "semantic_vad":
             turn = {"type": "semantic_vad", "eagerness": vad_eagerness,
-                    "create_response": create_response, "interrupt_response": True}
+                    "create_response": create_response, "interrupt_response": interrupt_response}
         elif vad == "server_vad":
             turn = {"type": "server_vad", "threshold": server_vad_threshold, "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500, "create_response": create_response, "interrupt_response": True}
+                    "silence_duration_ms": 500, "create_response": create_response,
+                    "interrupt_response": interrupt_response}
         else:
             turn = None
         audio_in: Dict[str, Any] = {

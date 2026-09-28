@@ -51,6 +51,13 @@ def add_audio_args(p: argparse.ArgumentParser) -> None:
     audio.add_argument("--gate", default="smart", choices=["smart", "half", "full"],
                        help="smart: pass user speech over the robot (barge-in), half: mute mic while "
                             "the robot talks, full: trust the AEC completely")
+    audio.add_argument("--barge-in", choices=["loud", "any", "stop"],
+                       default=os.environ.get("REALTIME_BARGE_IN", "loud"),
+                       help="what stops the robot's speech: loud = a voice clearly above the room, i.e. the person "
+                            "at the mic, not talk further away (default); any = any speech; stop = only a stop word")
+    audio.add_argument("--barge-in-margin-db", type=float, default=15.0,
+                       help="loud: how far the loudest 200 ms of a voice must be above the room's median level (dB); "
+                            "the log line 'speech over the robot' shows the measured value")
     audio.add_argument("--echo-delay-ms", type=float, default=None,
                        help="default: the value measured last time for this mic/speaker pair, else 0")
     audio.add_argument("--lead-ms", type=float, default=40.0)

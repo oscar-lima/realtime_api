@@ -90,3 +90,30 @@ def rosbridge_url(default: str = "ws://localhost:9090") -> str:
 
     return os.environ.get("ROSBRIDGE_URL", default)
 
+
+LAST_URL_FILE = "~/.cache/realtime_api/rosbridge_url"
+
+
+def remember_rosbridge_url(url: str) -> None:
+    """Note the rosbridge the voice agent uses, for helpers such as scripts/push_to_talk."""
+    import os
+
+    path = os.path.expanduser(LAST_URL_FILE)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(url + "\n")
+    except OSError:
+        pass
+
+
+def last_rosbridge_url(default: str = "ws://localhost:9090") -> str:
+    """The rosbridge the voice agent used last, else ``default``."""
+    import os
+
+    try:
+        with open(os.path.expanduser(LAST_URL_FILE)) as handle:
+            return handle.readline().strip() or default
+    except OSError:
+        return default
+

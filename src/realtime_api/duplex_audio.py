@@ -264,7 +264,7 @@ class EchoGate:
         min_level_dbfs: float = -50.0,
         attack_frames: int = 4,
         hangover_ms: int = 400,
-        preroll_ms: int = 200,
+        preroll_ms: int = 300,
         history_s: float = 6.0,
         percentile: float = 90.0,
         initial_coupling_db: float = -20.0,

@@ -49,12 +49,24 @@ microphone ─► InputStream ─(ADC timestamp t)─► AEC(mic, reference) ─
    - `smart` (default): while the robot talks, a frame is forwarded only if
      it is clearly louder, relative to what the speaker is playing, than the
      residual echo learned so far. That means a person is talking over the
-     robot, which is barge-in. Otherwise the gate sends silence.
+     robot, which is barge-in. Otherwise the gate sends silence. When it opens,
+   the 300 ms before are sent too, so the first syllable is not cut.
    - `half`: mute the mic while the robot talks.
    - `full`: trust the AEC completely.
-5. **Barge-in.** When the server VAD reports user speech while the robot is
-   talking, playback stops at once and the assistant message is truncated to
-   what was actually played.
+5. **Barge-in** (`--barge-in`). When the server VAD reports speech while the
+   robot talks:
+   - `loud` (default): playback stops only if the voice is clearly above the
+     room: its loudest 200 ms at least `--barge-in-margin-db` (15 dB) above
+     the median level of the last 30 s. That is the person at the
+     microphone, not talk further away in a crowded room (the SAB demo had 17
+     barge-ins, most from the room). In a quiet room every voice is far above
+     the floor, so it acts like `any`. The log line "speech over the robot:
+     N dB above the room" shows the measured value for tuning.
+   - `any`: every detected voice stops the robot (the behaviour before #190).
+   - `stop`: only a stop word stops it.
+   A stop word ("stop", "cancel", "stopp", "para", ...) stops the robot's
+   speech in every mode once its transcript arrives. In agent mode the
+   assistant message is truncated to what was actually played.
 
 ### Measured on real hardware
 
@@ -136,25 +148,32 @@ waits up to 30 s for it.
 | `/speak`, `/realtime/say` | String | in: spoken verbatim in the realtime voice |
 | `/mobipick_gpt/gpt_debug` | String | in: action progress, silent context ("what are you doing?") |
 | `/mobipick_gpt/busy` | Bool | in: an order runs, utterances go to it as events |
+| `/realtime/talk` | Bool | in: `--push-to-talk` only: true opens the mic, false closes it |
 | `/realtime/is_speaking` | Bool | out: robot voice audible (mobipick_gpt `listen` waits for it) |
 | `/realtime/user_transcript`, `/realtime/robot_transcript` | String | out: transcripts |
 
 Two modes (`--mode`, or `REALTIME_MODE`):
 
 - **bridge** (default): a pure speech bridge. For a command (an utterance
-  with an action verb: pick, place, bring, go, ...) the robot asks back "Did
-  you say: pick the coke?"; after a yes it goes verbatim to
+  with an action verb: pick, place, bring, go, ...) the robot reads the order
+  back as a short question, from its first sentence with a verb and without
+  a lead-in ("thank you very much. Now pick the Pringles" is asked as "Pick
+  the Pringles?"); after a yes the whole utterance goes verbatim to
   `/recognized_speech`, and the mobipick_gpt router, chatbot and planner
   decide what to do and what to say. A no drops it, "no, pick the sugar box"
-  asks about the correction, and an unanswered question lapses after 20 s.
+  asks about the correction. Other talk in between (a crowded room) does not
+  drop it: the order waits until the person had 15 s of quiet after the
+  robot's last sentence, at most 60 s. A stray word or a yes heard in another
+  script ("いや") makes the robot ask once more; after that such words are
+  ignored. A lone "it", "is" or "that" is neither a yes nor a request.
   Chat, questions and answers ("who built you?", "table 2", "yes") and
   "stop" or "cancel" go out at once. The language follows the person: the
   transcription detects it (`--language` pins one), and the robot says every
   sentence in the language the person last spoke, translating the agents'
   English when needed. English, Spanish and German are supported and can be
   mixed freely: commands are recognized by their verbs in all three
-  (pick/coge/nimm, ...), the question comes as "Did you say", "¿Dijiste" or
-  "Hast du gesagt", and yes/sí/ja or no/nein answer it. The confirmation keeps words that the
+  (pick/coge/nimm, ...), the question is asked in the person's language, and
+  yes/sí/ja or no/nein answer it. The confirmation keeps words that the
   transcription invents from fan or room noise away from the robot;
   `--no-confirm` (or `REALTIME_CONFIRM=0`) passes utterances on directly.
   The realtime model never replies on its own (`create_response: false`, and
@@ -165,8 +184,7 @@ Two modes (`--mode`, or `REALTIME_MODE`):
   answers into listed objects ("sí" became "soup"). `--transcription-hint`
   sets one. Command verbs are matched as stems, so conjugated and separable
   forms count (agarraras, herbringen). A single word is confirmed like a
-  command unless it answers a question the agents just asked, and a stray
-  word while a confirmation is pending makes the robot ask again.
+  command unless it answers a question the agents just asked.
 - **agent**: the realtime model is Mobipick's persona
   (`mobipick_gpt/config/prompts/realtime_voice.txt`, with the static facts of
   `chatbot.txt` filled in by `src/realtime_api/mobipick_prompt.py`). It
@@ -178,8 +196,21 @@ an event: mobipick_api buffers `/recognized_speech`, and the planner reads it
 with `check_for_events()` (a "cancel", "stop" or new information) or takes it
 as the answer to its question in `listen()`. Noise transcribed as filler or
 non-Latin text, a leaked transcription hint and the robot's own recent
-sentences are dropped. Turn detection is semantic VAD with `low`
-eagerness, which waits for complete sentences.
+sentences are dropped (an echo repeats the robot's words in its order, so an
+answer that reuses them, "Pick the Pringles." to "... should I pick them
+up?", is kept). Turn detection is semantic VAD with `low` eagerness, which
+waits for complete sentences; it has no pre-roll setting (server VAD keeps
+300 ms before the speech).
+
+**Push-to-talk** (`--push-to-talk`, `REALTIME_PUSH_TO_TALK=1`, or
+`voice_push_to_talk:=on` for `run_voice_agent.sh`; default off): during a
+public demo only the operator is heard. The mic is sent only after true
+arrives on `/realtime/talk`, until false or `--talk-timeout` (15 s); the
+300 ms before the switch go out too. `scripts/push_to_talk` is a keyboard
+switch for a terminal on the host (Enter opens, Enter closes), or
+`rostopic pub -1 /realtime/talk std_msgs/Bool true`. The ALU1's own mute
+button does the same without software, but the agent cannot tell a muted
+mic from a quiet room (#189), and speech started before unmuting is lost.
 
 ## Standalone demo
 
@@ -231,13 +262,13 @@ Useful flags (demo and voice agent):
 
 The session asks the API for `far_field` input noise reduction and
 `gpt-4o-mini-transcribe` user transcripts. Semantic VAD with
-`interrupt_response` handles turn-taking. Barge-in stops playback and
-truncates the answer to what was actually heard.
+`interrupt_response` (only with `--barge-in any`) handles turn-taking.
+Barge-in stops playback and truncates the answer to what was actually heard.
 
 ## Tests
 
 ```bash
-python3 -m pytest          # 30 tests, no audio hardware or network needed
+python3 -m pytest          # 58 tests, no audio hardware or network needed
 ```
 
 The tests simulate a reverberant room with real Piper speech
@@ -261,6 +292,7 @@ scripts/
   run_voice_agent.sh      host launcher used by the GUI button (venv, keys, rosbridge discovery)
   install_host.sh         one-time host venv
   voice_sampler           hear the robot voices
+  push_to_talk            keyboard switch for --push-to-talk (/realtime/talk)
   realtime_voice_demo     standalone demo (voice / --text / --echo-test)
   aec_loopback_test       hardware AEC benchmark across backends
   run_litellm_realtime.sh standalone LiteLLM proxy with the realtime aliases

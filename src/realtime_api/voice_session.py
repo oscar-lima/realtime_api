@@ -12,6 +12,7 @@ import collections
 import json
 import logging
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
@@ -53,6 +54,112 @@ ROBOT_COMMAND_TOOL = {
 }
 
 
+# --barge-in: what may stop the robot's speech. loud: a voice clearly above the room (the person at the
+# microphone, not talk further away in a crowded room); any: any speech the server detects; stop: only a stop
+# word (the agent stops the speech when its transcript arrives).
+BARGE_IN_MODES = ("loud", "any", "stop")
+BARGE_IN_CHECK_S = 1.5  # after the server hears speech over the robot, it may still grow loud this long
+
+
+def _power_db(power: float) -> float:
+    return 10.0 * float(np.log10(power / 32768.0 ** 2 + 1e-12))
+
+
+class RoomLevel:
+    """How far the voice at the microphone stands out of the room, for barge-in.
+
+    The floor is the median 10 ms level over the last ``history_s`` (frames the
+    echo gate replaced with silence do not count); the voice is the loudest
+    ``window_ms`` of the last ``recent_s``. Speech mixed into babble
+    (test_barge_in.py) reads 3-7 dB above its RMS difference to the babble,
+    and babble alone up to 5 dB: 15 dB lets a voice about 10 dB above the
+    crowd (the person at the microphone) through, not talk further away. In a
+    quiet room every voice is far above the floor.
+    """
+
+    def __init__(self, margin_db: float = 15.0, history_s: float = 30.0, recent_s: float = 1.0,
+                 window_ms: int = 200, min_history_s: float = 3.0) -> None:
+        self.margin_db = float(margin_db)
+        self._history: "collections.deque[float]" = collections.deque(maxlen=int(history_s * 100))
+        self._recent: "collections.deque[float]" = collections.deque(maxlen=int(recent_s * 100))
+        self._window = max(1, int(window_ms) // 10)
+        self._min_history = int(min_history_s * 100)
+        self._lock = threading.Lock()  # frames come from the mic thread, questions from the websocket thread
+
+    def add(self, frame: np.ndarray) -> None:
+        """One 10 ms frame of the cleaned mic signal."""
+        power = float(np.mean(frame.astype(np.float64) ** 2)) if frame.size else 0.0
+        with self._lock:
+            self._recent.append(power)
+            if power > 0.0:  # exact zeros: silence the echo gate sent instead of the mic
+                self._history.append(power)
+
+    def floor_db(self) -> float:
+        with self._lock:
+            history = np.array(self._history, dtype=float)
+        return _power_db(float(np.median(history))) if history.size else -120.0
+
+    def voice_db(self) -> float:
+        with self._lock:
+            recent = np.array(self._recent, dtype=float)
+        if recent.size == 0:
+            return -120.0
+        n = min(self._window, recent.size)
+        return _power_db(float(np.max(np.convolve(recent, np.ones(n) / n, mode="valid"))))
+
+    def above_floor_db(self) -> float:
+        return self.voice_db() - self.floor_db()
+
+    def loud(self) -> bool:
+        with self._lock:
+            known = len(self._history)
+        if known < self._min_history:
+            return True  # too little known about the room yet: any voice may interrupt
+        return self.above_floor_db() >= self.margin_db
+
+
+class TalkGate:
+    """Push-to-talk: the mic reaches the server only while the talk switch is on.
+
+    ``set(True)`` opens it for at most ``timeout_s`` (a forgotten switch closes
+    by itself), ``set(False)`` closes it after ``hangover_ms`` so the last word
+    is not cut. While closed, frames are held back ``preroll_ms`` and then sent
+    as silence: opening releases the moment before the press too, so the first
+    syllable is kept, and the stream keeps its length for the server's VAD.
+    """
+
+    def __init__(self, preroll_ms: int = 300, hangover_ms: int = 500, timeout_s: float = 15.0,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._hold: "collections.deque[np.ndarray]" = collections.deque()
+        self._preroll = max(1, int(preroll_ms) // 10)
+        self._hangover_s = hangover_ms / 1000.0
+        self.timeout_s = float(timeout_s)
+        self._open_until = 0.0
+        self._clock = clock
+
+    @property
+    def is_open(self) -> bool:
+        return self._clock() < self._open_until
+
+    def set(self, on: bool) -> None:
+        now = self._clock()
+        if on:
+            self._open_until = now + self.timeout_s
+        elif self._open_until > now:
+            self._open_until = now + self._hangover_s
+
+    def process(self, frame: np.ndarray) -> List[np.ndarray]:
+        """The frames to send for this mic frame: none, one, or the pre-roll at opening."""
+        if self.is_open:
+            out = list(self._hold) + [frame]
+            self._hold.clear()
+            return out
+        self._hold.append(frame)
+        if len(self._hold) > self._preroll:
+            return [np.zeros_like(self._hold.popleft())]
+        return []
+
+
 class VoiceSession:
     """Streams cleaned mic audio up, plays the answer, handles barge-in."""
 
@@ -66,11 +173,18 @@ class VoiceSession:
         on_tool_call: Optional[ToolCall] = None,
         send_chunk_ms: int = 40,
         speak_only: bool = False,
+        barge_in: str = "any",
+        barge_in_margin_db: float = 15.0,
+        push_to_talk: bool = False,
+        talk_timeout_s: float = 15.0,
     ) -> None:
         """``speak_only``: the model never answers on its own; ``say`` runs out of
         band (without the conversation, so it cannot drift into replying to
         what the person said) and any response it did not request is
-        cancelled and muted."""
+        cancelled and muted. ``barge_in``: one of ``BARGE_IN_MODES``.
+        ``push_to_talk``: the mic is sent only while ``set_talk(True)``."""
+        if barge_in not in BARGE_IN_MODES:
+            raise ValueError(f"unknown barge-in mode {barge_in!r}")
         self.client = client
         self.engine = engine
         self.on_user_text = on_user_text
@@ -89,6 +203,10 @@ class VoiceSession:
         self._rejected: "set[str]" = set()  # responses nobody asked for (speak_only)
         # speak_only: the person's language; say() translates into it when needed
         self.language = "English"
+        self.barge_in = barge_in
+        self.room = RoomLevel(barge_in_margin_db)
+        self._barge_check_until = 0.0
+        self.talk: Optional[TalkGate] = TalkGate(timeout_s=talk_timeout_s) if push_to_talk else None
 
         client.on("response.created", self._on_response_created)
         client.on("response.output_audio.delta", self._on_audio_delta)
@@ -98,6 +216,7 @@ class VoiceSession:
         client.on("response.output_text.done", self._on_text_done)
         client.on("conversation.item.input_audio_transcription.completed", self._on_user_transcript)
         client.on("input_audio_buffer.speech_started", self._on_speech_started)
+        client.on("input_audio_buffer.speech_stopped", self._on_speech_stopped)
         client.on("response.done", self._on_response_done)
         if engine is not None:
             engine.add_frame_callback(self._on_mic_frame)
@@ -105,16 +224,26 @@ class VoiceSession:
     # ------------------------------------------------------------ upstream
 
     def _on_mic_frame(self, frame: np.ndarray, info: Dict[str, object]) -> None:
+        self.room.add(frame)
+        if self._barge_check_until:
+            self._check_barge_in()
+        frames = [frame] if self.talk is None else self.talk.process(frame)
         if not self.client.session_ready.is_set() or self.client.closed.is_set():
             return
-        with self._lock:
-            self._chunk.append(frame)
-            if len(self._chunk) < self._chunk_frames:
-                return
-            pcm16k = np.concatenate(self._chunk)
-            self._chunk = []
-            pcm24k = self._up.process(pcm16k)
-        self.client.append_audio(pcm24k)
+        for out in frames:
+            with self._lock:
+                self._chunk.append(out)
+                if len(self._chunk) < self._chunk_frames:
+                    continue
+                pcm16k = np.concatenate(self._chunk)
+                self._chunk = []
+                pcm24k = self._up.process(pcm16k)
+            self.client.append_audio(pcm24k)
+
+    def set_talk(self, on: bool) -> None:
+        """Push-to-talk switch (no effect without ``push_to_talk``)."""
+        if self.talk is not None:
+            self.talk.set(on)
 
     # ------------------------------------------------------------ downstream
 
@@ -217,9 +346,35 @@ class VoiceSession:
             self.on_user_text(event.get("transcript", "").strip())
 
     def _on_speech_started(self, event: Dict[str, Any]) -> None:
-        """Barge-in: the user talks while the robot speaks -> stop talking."""
-        if self.engine is None or not self.engine.is_playing():
+        """Barge-in: the person talks while the robot speaks -> stop talking (see ``BARGE_IN_MODES``)."""
+        if self.engine is None or not self.engine.is_playing() or self.barge_in == "stop":
             return
+        if self.barge_in == "any":
+            self.interrupt()
+            return
+        # logged for tuning --barge-in-margin-db with the next crowd
+        _LOG.info("speech over the robot: %.0f dB above the room (barge-in from %.0f dB)",
+                  self.room.above_floor_db(), self.room.margin_db)
+        if self.room.loud():
+            self.interrupt("loud voice")
+        else:
+            self._barge_check_until = time.monotonic() + BARGE_IN_CHECK_S
+
+    def _on_speech_stopped(self, event: Dict[str, Any]) -> None:
+        self._barge_check_until = 0.0
+
+    def _check_barge_in(self) -> None:
+        """Speech the server heard over the robot: stop the robot once it gets loud (mic thread)."""
+        if time.monotonic() > self._barge_check_until or self.engine is None or not self.engine.is_playing():
+            self._barge_check_until = 0.0
+        elif self.room.loud():
+            self._barge_check_until = 0.0
+            self.interrupt("loud voice")
+
+    def interrupt(self, reason: str = "") -> bool:
+        """Stop the robot's speech now; False if it was not speaking."""
+        if self.engine is None or not self.engine.is_playing():
+            return False
         item = self.engine.stop_playback()
         self.interruptions += 1
         if item:
@@ -228,7 +383,10 @@ class VoiceSession:
             played = self.engine.playback.played_ms(item)
             if not self.speak_only:  # out-of-band items are not in the conversation
                 self.client.truncate(item, played)
-            _LOG.info("barge-in: stopped robot speech after %d ms", played)
+                if self.barge_in != "any":
+                    self.client.cancel_response()  # the server interrupts it only for "any"
+            _LOG.info("barge-in: stopped robot speech after %d ms%s", played, f" ({reason})" if reason else "")
+        return True
 
     def _on_response_done(self, event: Dict[str, Any]) -> None:
         self.response_active = False
