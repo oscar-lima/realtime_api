@@ -218,6 +218,8 @@ class VoiceSession:
         client.on("input_audio_buffer.speech_started", self._on_speech_started)
         client.on("input_audio_buffer.speech_stopped", self._on_speech_stopped)
         client.on("response.done", self._on_response_done)
+        client.on("connection.closed", self._on_connection_closed)
+        client.on("session.updated", lambda event: self._flush_say())  # also a new session after a reconnect
         if engine is not None:
             engine.add_frame_callback(self._on_mic_frame)
 
@@ -283,10 +285,17 @@ class VoiceSession:
             "item": {"type": "message", "role": "system", "content": [{"type": "input_text", "text": text}]},
         })
 
+    def _on_connection_closed(self, event: Dict[str, Any]) -> None:
+        """No answer streams any more; sentences to say wait for the next session (reconnect)."""
+        with self._lock:
+            self.response_active = False
+            self._chunk = []
+
     def _flush_say(self) -> None:
         with self._lock:
-            if self.response_active or not self._say_queue:
-                return
+            if self.response_active or not self._say_queue or not self.client.session_ready.is_set() \
+                    or self.client.closed.is_set():
+                return  # a sentence waits for the next session instead of going into a closed socket
             text = self._say_queue.popleft()
             self.response_active = True  # until response.created/done arrive
         if self.speak_only:

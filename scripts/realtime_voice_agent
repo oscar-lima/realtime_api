@@ -172,6 +172,8 @@ CONFIRM_MAX_S = 60.0
 DEAD_MIC_SENTENCE = "My microphone is muted or not delivering sound, so I cannot hear you."
 DEAD_MIC_SAY_EVERY_S = 300.0
 MIC_OK_EVERY_S = 10.0  # /realtime/mic_ok is repeated this often for late subscribers
+# the API ends every session after 60 minutes (#186): a new one is opened, waiting this long before each further try
+RECONNECT_WAIT_S = (0.0, 2.0, 5.0, 10.0, 30.0)
 ANSWER_WINDOW_S = 40.0  # a question of the agents stays open this long for one-word answers
 
 
@@ -333,6 +335,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-dead-mic-say", dest="dead_mic_say", action="store_false",
                    default=os.environ.get("REALTIME_DEAD_MIC_SAY", "1") != "0",
                    help="only log and publish a muted mic, do not say it aloud (at most every 5 min otherwise)")
+    p.add_argument("--reconnect-tries", type=int, default=int(os.environ.get("REALTIME_RECONNECT_TRIES", "5")),
+                   help="when the realtime session ends (60 min limit, network), open a new one this many times "
+                        "before giving up (0: exit at once, the old behaviour)")
     p.add_argument("--talk-timeout", type=float, default=15.0,
                    help="push-to-talk: the mic closes by itself this many seconds after a true")
     ros.add_argument("--prompt-dir", default=os.environ.get("MOBIPICK_PROMPT_DIR", DEFAULT_PROMPT_DIR))
@@ -390,7 +395,8 @@ class VoiceAgent:
             push_to_talk=args.push_to_talk, talk_timeout_s=args.talk_timeout,
         )
         self.stop = threading.Event()
-        self.client.on("connection.closed", lambda e: self.stop.set())
+        self._lost = threading.Event()  # the realtime session ended without our Ctrl-C
+        self.client.on("connection.closed", lambda e: self._lost.set())
 
     # ---------------------------------------------------------------- person -> agents
 
@@ -655,8 +661,40 @@ class VoiceAgent:
                   f"(scripts/push_to_talk, or: rostopic pub -1 {self.args.talk_topic} std_msgs/Bool true); "
                   f"it closes on false or after {self.args.talk_timeout:.0f} s", flush=True)
         self._say_self("Hello, I am Mobipick. How can I help you?")
-        self.stop.wait()
+        return self._serve()
+
+    def _serve(self) -> int:
+        """Run until Ctrl-C; open a new realtime session whenever the server ends one (60 min limit, #186)."""
+        while not self.stop.is_set():
+            if not self._lost.wait(0.5) or self.stop.is_set():
+                continue
+            self._lost.clear()
+            if not self._reconnect():
+                return 1
+            if not self.client.closed.is_set():
+                self._lost.clear()  # closes of failed tries on the way
         return 0
+
+    def _reconnect(self) -> bool:
+        """A new session with the same configuration; the audio, ROS topics and language stay as they are."""
+        error = self.client.last_error or {}
+        reason = error.get("code") or error.get("message") or "connection closed"
+        tries = self.args.reconnect_tries
+        for attempt in range(tries):
+            if self.stop.wait(RECONNECT_WAIT_S[min(attempt, len(RECONNECT_WAIT_S) - 1)]):
+                return False
+            self._print(f"  ~  realtime session ended ({reason}): opening a new one, try {attempt + 1}/{tries}")
+            try:
+                self.client.reconnect()
+                if self.client.wait_ready(15):
+                    self._print("  ~  new realtime session ready (same voice, language and topics)")
+                    return True
+                reason = (self.client.last_error or {}).get("message") or "session not ready"
+            except Exception as exc:  # handshake refused, proxy down, ...
+                reason = str(exc).split(" -+-+- ")[0]
+        self._print(f"realtime session ended ({reason}) and no new one could be opened: exiting"
+                    if tries else f"realtime session ended ({reason}): exiting (--reconnect-tries 0)")
+        return False
 
     def shutdown(self) -> None:
         self.stop.set()

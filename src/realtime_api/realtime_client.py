@@ -230,6 +230,25 @@ class RealtimeClient:
         self._reader = threading.Thread(target=self._read_loop, name="realtime-rx", daemon=True)
         self._reader.start()
 
+    def reconnect(self) -> None:
+        """Open a new socket and session with the last configuration, keeping every handler.
+
+        The server ends each session after 60 minutes (``session_expired``,
+        #186). Raises like ``connect`` when the handshake fails.
+        """
+        self.close()
+        if self._reader is not None and self._reader is not threading.current_thread():
+            self._reader.join(timeout=5.0)  # its "connection.closed" is out before the new session starts
+        self.connected.clear()
+        self.session_ready.clear()
+        self.last_error = None
+        self.closed.clear()
+        try:
+            self.connect(self._session)
+        except Exception:
+            self.closed.set()
+            raise
+
     def wait_ready(self, timeout: float = 15.0) -> bool:
         """Wait for ``session.updated``; False on timeout, error or close."""
         deadline = time.monotonic() + timeout
@@ -257,6 +276,7 @@ class RealtimeClient:
                 _LOG.warning("realtime connection closed: %s", exc)
         finally:
             self.closed.set()
+            self.session_ready.clear()
             self._dispatch({"type": "connection.closed"})
 
     def close(self) -> None:

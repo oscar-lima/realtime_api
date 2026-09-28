@@ -261,3 +261,73 @@ def test_a_muted_microphone_is_reported_and_said_once_in_a_while(rva):
     agent.args.dead_mic_say = False
     tick(1.0, True)
     assert tick(400.0, False) == [("/realtime/mic_ok", False)]
+
+
+def serving_agent(rva, monkeypatch, server, tries=3):
+    """A voice agent with a real RealtimeClient on a fake websocket server, serving in a thread."""
+    import sys
+    import threading
+
+    from realtime_api.realtime_client import RealtimeClient, build_session
+
+    monkeypatch.setitem(sys.modules, "websocket", server)
+    monkeypatch.setattr(rva, "RECONNECT_WAIT_S", (0.0, 0.05))
+    agent = make_agent(rva, languages="en")
+    agent.args.reconnect_tries = tries
+    agent.stop, agent._lost = threading.Event(), threading.Event()
+    agent.client = RealtimeClient("ws://test", "token")
+    agent.client.on("connection.closed", lambda e: agent._lost.set())
+    agent.lines = []
+    agent._print = agent.lines.append
+    agent.client.connect(build_session("x", language="en"))
+    assert agent.client.wait_ready(2)
+    result = []
+    thread = threading.Thread(target=lambda: result.append(agent._serve()), daemon=True)
+    thread.start()
+    return agent, thread, result
+
+
+def wait_for(condition, seconds=3.0):
+    import time
+
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return condition()
+
+
+def test_an_expired_session_is_replaced_and_the_agent_keeps_running(rva, monkeypatch):
+    import threading
+
+    from test_realtime_client import FakeServer
+
+    server = FakeServer()
+    agent, thread, result = serving_agent(rva, monkeypatch, server)
+    agent.language, agent.voice.language = "de", "German"
+    threading.Timer(0.2, server.connections[0].expire).start()  # the fake server ends the session after 0.2 s
+    assert wait_for(lambda: len(server.connections) == 2 and agent.client.session_ready.is_set())
+    assert thread.is_alive() and not result
+    assert any("session_expired" in line for line in agent.lines)
+    assert agent.language == "de" and agent.voice.language == "German"
+    server.connections[1].expire()  # and the next hour too
+    assert wait_for(lambda: len(server.connections) == 3 and agent.client.session_ready.is_set())
+    agent.stop.set()  # Ctrl-C
+    agent.client.close()
+    thread.join(2)
+    assert result == [0]
+
+
+def test_the_agent_exits_when_no_new_session_opens(rva, monkeypatch):
+    from test_realtime_client import FakeServer
+
+    server = FakeServer()
+    agent, thread, result = serving_agent(rva, monkeypatch, server, tries=2)
+
+    def refuse(url, header=None, timeout=None):
+        raise ConnectionRefusedError("proxy down")
+
+    server.create_connection = refuse
+    server.connections[0].expire()
+    thread.join(3)
+    assert result == [1]
+    assert sum("opening a new one" in line for line in agent.lines) == 2 and "exiting" in agent.lines[-1]

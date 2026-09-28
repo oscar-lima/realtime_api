@@ -224,6 +224,16 @@ so I cannot hear you." (at most every 5 min; `--no-dead-mic-say` or
 on purpose). "the microphone delivers sound again" and true follow when it
 comes back.
 
+**Session limit** (#186). The Realtime API ends every session after 60
+minutes (`session_expired`, close 1001). The agent then opens a new session
+with the same configuration at once and keeps the audio engine, the ROS
+topics, the language and any sentence still to be said; it logs "realtime
+session ended (session_expired): opening a new one" and "new realtime
+session ready". A network drop is handled the same way. After
+`--reconnect-tries` (5, env `REALTIME_RECONNECT_TRIES`; waits 0, 2, 5, 10,
+30 s) failed tries it exits; `--reconnect-tries 0` exits at once as before.
+In agent mode the model's conversation history starts afresh.
+
 ## Standalone demo
 
 ### 1. Check the echo cancellation (no API, no cost)
@@ -280,7 +290,7 @@ Barge-in stops playback and truncates the answer to what was actually heard.
 ## Tests
 
 ```bash
-python3 -m pytest          # 60 tests, no audio hardware or network needed
+python3 -m pytest          # 64 tests, no audio hardware or network needed
 ```
 
 The tests simulate a reverberant room with real Piper speech

@@ -2,8 +2,11 @@
 
 import base64
 import json
+import time
+import types
 
 import numpy as np
+import pytest
 
 from realtime_api.realtime_client import RealtimeClient, build_session, ga_to_beta_session, resolve_endpoint
 from realtime_api.voice_session import ROBOT_COMMAND_TOOL, VoiceSession
@@ -168,6 +171,7 @@ def test_benign_server_errors_do_not_count_as_failures():
 
 def test_speak_only_says_out_of_band_and_mutes_unrequested_answers():
     client = make_client()
+    client.session_ready.set()
     engine = FakeEngine()
     session = VoiceSession(client, engine, speak_only=True)
     session.say("I picked the coke.")
@@ -182,3 +186,91 @@ def test_speak_only_says_out_of_band_and_mutes_unrequested_answers():
     client._dispatch({"type": "response.output_audio.delta", "response_id": "r2", "item_id": "item_9",
                       "delta": base64.b64encode(np.ones(10, dtype=np.int16).tobytes()).decode()})
     assert engine.queued == []
+
+
+class FakeServer:
+    """A fake ``websocket`` module: every connection greets, confirms session.update, and can expire."""
+
+    def __init__(self):
+        self.connections = []
+
+    def create_connection(self, url, header=None, timeout=None):
+        conn = FakeConnection()
+        self.connections.append(conn)
+        return conn
+
+
+class FakeConnection:
+    def __init__(self):
+        import queue
+
+        self.incoming = queue.Queue()
+        self.sent = []
+        self.incoming.put({"type": "session.created", "session": {"type": "realtime", "model": "fake"}})
+
+    def settimeout(self, value):
+        pass
+
+    def recv(self):
+        event = self.incoming.get(timeout=5)
+        return "" if event is None else json.dumps(event)
+
+    def send(self, data):
+        event = json.loads(data)
+        self.sent.append(event)
+        if event["type"] == "session.update":
+            self.incoming.put({"type": "session.updated", "session": event["session"]})
+
+    def expire(self):
+        """What the API does after 60 minutes."""
+        self.incoming.put({"type": "error", "error": {"type": "invalid_request_error", "code": "session_expired",
+                                                      "message": "Your session hit the maximum duration of 60 minutes."}})
+        self.incoming.put(None)
+
+    def close(self):
+        self.incoming.put(None)
+
+
+def test_reconnect_opens_a_new_session_with_the_same_configuration_and_handlers(monkeypatch):
+    import sys
+
+    server = FakeServer()
+    monkeypatch.setitem(sys.modules, "websocket", server)
+    client = RealtimeClient("ws://test", "token")
+    engine = FakeEngine()
+    session = VoiceSession(client, engine, speak_only=True)
+    closed = []
+    client.on("connection.closed", closed.append)
+    config = build_session("x", language="en")
+    client.connect(config)
+    assert client.wait_ready(2)
+    server.connections[0].expire()
+    assert client.closed.wait(2) and client.last_error["code"] == "session_expired"
+    session.say("Sorry, I was away.")  # waits for the next session instead of being lost
+    client.reconnect()
+    assert client.wait_ready(2) and not client.closed.is_set() and len(closed) == 1
+    second = server.connections[1].sent
+    assert second[0] == {"type": "session.update", "session": config, "event_id": second[0]["event_id"]}
+    said = lambda: any(e["type"] == "response.create" and "Sorry, I was away." in e["response"]["instructions"]  # noqa: E731
+                       for e in list(second))
+    deadline = time.monotonic() + 2
+    while not said() and time.monotonic() < deadline:  # flushed by the session.updated handler (reader thread)
+        time.sleep(0.01)
+    assert said()
+    client.close()
+
+
+def test_a_failed_reconnect_leaves_the_client_closed(monkeypatch):
+    import sys
+
+    def refuse(url, header=None, timeout=None):
+        raise ConnectionRefusedError("proxy down")
+
+    monkeypatch.setitem(sys.modules, "websocket", types.SimpleNamespace(create_connection=refuse))
+    client = RealtimeClient("ws://test", "token")
+    client._session = {"type": "realtime"}
+    with pytest.raises(ConnectionRefusedError):
+        client.reconnect()
+    assert client.closed.is_set()
+    client.send({"type": "input_audio_buffer.append"})  # silently dropped, no exception
+
