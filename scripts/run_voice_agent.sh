@@ -39,29 +39,36 @@ if [[ -z "${LITELLM_API_KEY:-}" && -f "$workspace_src/litellm_master_key" ]]; th
   export LITELLM_API_KEY
 fi
 export LITELLM_BASE_URL="${LITELLM_BASE_URL:-http://127.0.0.1:4000/v1}"
-# The Mobipick containers live on the "mobipick" Docker network, so rosbridge
-# (started by GPT Robot Demo) is not on the host's localhost. Find the
-# container that accepts connections on :9090 (read-only docker inspection).
+# In the simulation the Mobipick containers live on the "mobipick" Docker network, so rosbridge
+# (started by GPT Robot Demo) is not on the host's localhost: find the container that accepts
+# connections on :9090 (read-only docker inspection). With the real robot it is on localhost.
 find_rosbridge() {
-  local network="${MOBIPICK_DOCKER_NETWORK:-mobipick}" ip
+  local network="${MOBIPICK_DOCKER_NETWORK:-mobipick}" port="${ROSBRIDGE_PORT:-9090}" ip
+  # remote ROS master (real robot): the demo containers use host networking, so rosbridge is on localhost at once;
+  # before #62 the network search below ran 30 s first (the voice agent took 35 s to start)
+  if timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+    printf 'ws://localhost:%s' "$port"
+    return 0
+  fi
   for ip in $(docker network inspect "$network" \
       -f '{{range .Containers}}{{.IPv4Address}} {{end}}' 2>/dev/null); do
     ip="${ip%/*}"
-    if timeout 1 bash -c "echo > /dev/tcp/$ip/9090" 2>/dev/null; then
-      printf 'ws://%s:9090' "$ip"
+    if timeout 1 bash -c "echo > /dev/tcp/$ip/$port" 2>/dev/null; then
+      printf 'ws://%s:%s' "$ip" "$port"
       return 0
     fi
   done
-  printf 'ws://localhost:9090'
+  printf 'ws://localhost:%s' "$port"
+  return 1
 }
 if [[ -z "${ROSBRIDGE_URL:-}" ]]; then
   # GPT Robot Demo may still be starting: wait up to 30 s for its rosbridge
-  for _ in $(seq 1 30); do
-    ROSBRIDGE_URL="$(find_rosbridge)"
-    [[ "$ROSBRIDGE_URL" != "ws://localhost:9090" ]] && break
+  for _ in $(seq 1 "${ROSBRIDGE_WAIT_S:-30}"); do
+    ROSBRIDGE_URL="$(find_rosbridge)" && break
     sleep 1
   done
 fi
+[[ -n "${ROSBRIDGE_ONLY_FIND:-}" ]] && { printf '%s\n' "$ROSBRIDGE_URL"; exit 0; }   # test hook
 export ROSBRIDGE_URL
 printf 'rosbridge: %s\n' "$ROSBRIDGE_URL"
 export PYTHONUNBUFFERED=1
