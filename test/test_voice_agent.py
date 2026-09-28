@@ -274,6 +274,7 @@ def serving_agent(rva, monkeypatch, server, tries=3):
     monkeypatch.setattr(rva, "RECONNECT_WAIT_S", (0.0, 0.05))
     agent = make_agent(rva, languages="en")
     agent.args.reconnect_tries = tries
+    agent.args.silence_watchdog, agent._probe_at, agent.session_config = 0.0, None, None
     agent.stop, agent._lost = threading.Event(), threading.Event()
     agent.client = RealtimeClient("ws://test", "token")
     agent.client.on("connection.closed", lambda e: agent._lost.set())
@@ -354,4 +355,26 @@ def test_english_only_drops_an_utterance_without_english_words(rva):
         assert rva.foreign_only(text) == "", text
     agent = make_agent(rva, languages="en,de,es")
     assert talk(agent, "Danke, sehr gut") == [("pass", "Danke, sehr gut")]   # allowed there
+
+
+def test_a_silent_session_is_probed_and_replaced(rva, monkeypatch):
+    """#25: the server stopped sending events while the socket stayed open; only a restart helped."""
+    from test_realtime_client import FakeServer
+
+    server = FakeServer()
+    agent, thread, result = serving_agent(rva, monkeypatch, server)
+    agent.args.silence_watchdog = 0.3
+    agent.session_config = agent.client._session
+    monkeypatch.setattr(rva, "WATCHDOG_PROBE_S", 0.3)
+    agent._clock = rva.time.monotonic
+    first = server.connections[0]
+    first.send = lambda data: first.sent.append(rva.json.loads(data))   # a dead session: no answer to anything
+    assert wait_for(lambda: len(server.connections) == 2 and agent.client.session_ready.is_set(), 6.0)
+    assert any(e["type"] == "session.update" for e in first.sent[1:])      # probed before it was closed
+    assert any("silent" in line for line in agent.lines) and thread.is_alive()
+    agent.args.silence_watchdog = 0.0                                       # off: nothing more happens
+    agent.stop.set()
+    agent.client.close()
+    thread.join(3)
+    assert result == [0] and len(server.connections) == 2
 

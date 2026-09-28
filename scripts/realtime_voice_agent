@@ -182,6 +182,9 @@ DEAD_MIC_SAY_EVERY_S = 300.0
 MIC_OK_EVERY_S = 10.0  # /realtime/mic_ok is repeated this often for late subscribers
 # the API ends every session after 60 minutes (#186): a new one is opened, waiting this long before each further try
 RECONNECT_WAIT_S = (0.0, 2.0, 5.0, 10.0, 30.0)
+# #25: a session that stays open but sends nothing any more is probed with a session.update; no answer in this time
+# closes it and a new one is opened like after the 60 min limit
+WATCHDOG_PROBE_S = 15.0
 ANSWER_WINDOW_S = 40.0  # a question of the agents stays open this long for one-word answers
 
 
@@ -366,6 +369,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reconnect-tries", type=int, default=int(os.environ.get("REALTIME_RECONNECT_TRIES", "5")),
                    help="when the realtime session ends (60 min limit, network), open a new one this many times "
                         "before giving up (0: exit at once, the old behaviour)")
+    p.add_argument("--silence-watchdog", type=float, default=float(os.environ.get("REALTIME_SILENCE_WATCHDOG_S", "60")),
+                   help="after this many seconds without any server event, probe the session and open a new one if "
+                        "it does not answer within 15 s (0: off)")
     p.add_argument("--talk-timeout", type=float, default=15.0,
                    help="push-to-talk: the mic closes by itself this many seconds after a true")
     ros.add_argument("--prompt-dir", default=os.environ.get("MOBIPICK_PROMPT_DIR", DEFAULT_PROMPT_DIR))
@@ -424,6 +430,7 @@ class VoiceAgent:
         )
         self.stop = threading.Event()
         self._lost = threading.Event()  # the realtime session ended without our Ctrl-C
+        self._probe_at: "float | None" = None  # when the silence watchdog sent its probe
         self.client.on("connection.closed", lambda e: self._lost.set())
 
     # ---------------------------------------------------------------- person -> agents
@@ -697,6 +704,7 @@ class VoiceAgent:
         """Run until Ctrl-C; open a new realtime session whenever the server ends one (60 min limit, #186)."""
         while not self.stop.is_set():
             if not self._lost.wait(0.5) or self.stop.is_set():
+                self._watch_session()
                 continue
             self._lost.clear()
             if not self._reconnect():
@@ -705,10 +713,33 @@ class VoiceAgent:
                 self._lost.clear()  # closes of failed tries on the way
         return 0
 
+    def _watch_session(self) -> None:
+        """#25: the server stopped sending anything while the socket stayed open (only a restart helped). After
+        --silence-watchdog seconds without an event, send the session config again (the server answers with
+        session.updated); no event within WATCHDOG_PROBE_S closes the socket, and _serve opens a new session."""
+        limit = self.args.silence_watchdog
+        if limit <= 0 or not self.client.session_ready.is_set():
+            self._probe_at = None
+            return
+        now = self._clock()
+        if self._probe_at is None:
+            if now - self.client.last_event_at >= limit:
+                self._probe_at = now
+                self.client.update_session(self.session_config)
+        elif self.client.last_event_at >= self._probe_at:
+            self._probe_at = None  # it answered
+        elif now - self._probe_at >= WATCHDOG_PROBE_S:
+            self._probe_at = None
+            self._print(f"  ~  realtime session silent for {now - self.client.last_event_at:.0f} s, no answer to a "
+                        "probe: closing it")
+            self.client.last_error = {"code": "silent_session", "message": "no server event and no answer to a probe"}
+            self.client.close()  # connection.closed -> _serve opens a new session
+
     def _reconnect(self) -> bool:
         """A new session with the same configuration; the audio, ROS topics and language stay as they are."""
         error = self.client.last_error or {}
         reason = error.get("code") or error.get("message") or "connection closed"
+        self._probe_at = None
         tries = self.args.reconnect_tries
         for attempt in range(tries):
             if self.stop.wait(RECONNECT_WAIT_S[min(attempt, len(RECONNECT_WAIT_S) - 1)]):

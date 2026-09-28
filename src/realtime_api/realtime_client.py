@@ -183,6 +183,7 @@ class RealtimeClient:
         self.protocol = "ga"
         self.last_error: Optional[Dict[str, Any]] = None
         self._session: Optional[Dict[str, Any]] = None
+        self.last_event_at = time.monotonic()  # when the server last sent anything (silence watchdog, #25)
 
     # -------------------------------------------------------------- events
 
@@ -191,6 +192,7 @@ class RealtimeClient:
         self._handlers.setdefault(event_type, []).append(handler)
 
     def _dispatch(self, event: Dict[str, Any]) -> None:
+        self.last_event_at = time.monotonic()
         etype = event.get("type", "")
         etype = _BETA_ALIASES.get(etype, etype)
         event["type"] = etype
