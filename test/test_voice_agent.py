@@ -344,3 +344,14 @@ def test_a_sentence_that_starts_with_a_stop_word_stops_at_once(rva):
     assert rva.is_stop("para") and rva.is_stop("please stop")
     assert not rva.is_stop("Can you cancel that and pick the pear")  # not at the start
 
+
+def test_english_only_drops_an_utterance_without_english_words(rva):
+    """#176: "Sind Sie located?" passed the English-only filter and the robot answered in German."""
+    agent = make_agent(rva, languages="en")
+    for text in ["Sind Sie located?", "Wie geht es dir?", "Gracias, muy bien", "Merci beaucoup"]:
+        assert talk(agent, text) == [], text
+    for text in ["Oscar is working.", "Hi Alex", "Felix Achterheld.", "Pick the Pringles.", "Ya.", "Yes, I did."]:
+        assert rva.foreign_only(text) == "", text
+    agent = make_agent(rva, languages="en,de,es")
+    assert talk(agent, "Danke, sehr gut") == [("pass", "Danke, sehr gut")]   # allowed there
+

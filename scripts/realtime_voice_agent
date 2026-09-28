@@ -145,10 +145,18 @@ LANGUAGE_WORDS = {
     "de": {"der", "die", "das", "und", "ist", "nicht", "ich", "du", "bitte", "zum", "zur", "den", "dem", "ein",
            "eine", "mit", "auf", "tisch", "hallo", "wir", "sprechen", "deutsch", "kannst", "wo", "wer", "was"},
 }
+# #176: common words that are no English words, so an utterance without any English word but with these is foreign
+# (with --languages en "Sind Sie located?" scored nothing and passed as English); not "ya" (a transcribed "yeah")
+LANGUAGE_WORDS["de"] |= {"sind", "sie", "bist", "bin", "haben", "hat", "wie", "wann", "warum", "noch", "schon", "auch",
+                         "nein", "ja", "gut", "mein", "dein", "wir", "uns", "kein", "keine", "mal", "manchmal",
+                         "jetzt", "hier", "dort", "danke", "gerne", "sehr", "doch", "oder", "aber", "nur"}
+LANGUAGE_WORDS["es"] |= {"yo", "usted", "eso", "esto", "aquí", "allí", "gracias", "bien", "también", "ahora", "hay",
+                         "soy", "estoy", "tengo", "puedo", "vamos", "grupo", "bueno", "nada", "nosotros"}
 LANGUAGE_WORDS["it"] = {"il", "lo", "gli", "le", "di", "che", "e", "è", "per", "con", "tavolo", "ciao", "voglio",
                         "puoi", "dove", "cosa", "come", "questo", "quello", "non", "sono", "della", "nel"}
 LANGUAGE_WORDS["fr"] = {"le", "la", "les", "de", "des", "du", "et", "est", "un", "une", "pour", "avec", "table",
-                        "bonjour", "je", "tu", "vous", "où", "quoi", "comment", "ce", "cette", "pas", "sur"}
+                        "bonjour", "je", "tu", "vous", "où", "quoi", "comment", "ce", "cette", "pas", "sur", "moi",
+                        "toi", "oui", "non", "merci", "très", "voilà"}
 LANGUAGE_NAMES = {"en": "English", "es": "Spanish", "de": "German", "it": "Italian", "fr": "French"}
 # --languages: the languages the demo accepts. Utterances confidently in another language, or in a non-Latin
 # script (noise often comes back as Chinese or Russian), are dropped instead of reaching the agents.
@@ -244,6 +252,17 @@ def detect_language(text: str, current: str = "en") -> str:
     if scores[best] >= 2 and list(scores.values()).count(scores[best]) == 1:
         return best
     return current
+
+
+def foreign_only(text: str) -> str:
+    """The other language of an utterance without a single English word but with a common word of another
+    language ("Sind Sie located?" -> "de"), else "" (#176: with only English allowed it is dropped)."""
+    words = words_of(text)
+    if any(w in LANGUAGE_WORDS["en"] or ACTION_RE["en"].match(w) for w in words):
+        return ""
+    scores = {lang: sum(w in common for w in words) for lang, common in LANGUAGE_WORDS.items() if lang != "en"}
+    best = max(scores, key=scores.get)
+    return best if scores[best] >= 1 else ""
 
 
 def is_command(text: str, language: str = "en") -> bool:
@@ -432,6 +451,8 @@ class VoiceAgent:
             self._print("  x  ignored: not in an allowed language (--languages %s)" % self.args.languages)
             return
         detected = detect_language(text, self.language)
+        if self.allowed_languages == ["en"] and detected == "en":
+            detected = foreign_only(text) or detected
         if detected not in self.allowed_languages:
             self._print(f"  x  ignored: {LANGUAGE_NAMES[detected]} is not allowed (--languages {self.args.languages})")
             return
