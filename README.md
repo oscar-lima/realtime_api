@@ -234,6 +234,18 @@ session ready". A network drop is handled the same way. After
 30 s) failed tries it exits; `--reconnect-tries 0` exits at once as before.
 In agent mode the model's conversation history starts afresh.
 
+**Robot speaker** (`scripts/robot_speaker.sh`, GUI button "Robot Speaker",
+real robot only: `route:=on`). The voice goes to a laptop null sink
+`mobipick_robot` whose monitor is streamed with `parec | ssh robot pacat`
+into the robot's USB speaker; a dead pipe is restarted. After a network drop
+the robot-side pacat of the old pipe can keep running (its ssh is gone, it
+never gets EOF), and on 2026-09-28 the robot stayed silent next to the new
+one (#187). `clean:=on` (or `ROBOT_SPEAKER_CLEAN=1`, default off until tested
+on the robot) tags the robot-side pacat, kills this script's earlier ones
+before each start and on stop, and logs 3 s after a start whether exactly one
+plays. Manual fix without it: stop the button, `pkill -x pacat` on the robot,
+start the button.
+
 ## Standalone demo
 
 ### 1. Check the echo cancellation (no API, no cost)
@@ -312,6 +324,7 @@ src/realtime_api/
 scripts/
   realtime_voice_agent    Mobipick voice agent (ROS over rosbridge)
   run_voice_agent.sh      host launcher used by the GUI button (venv, keys, rosbridge discovery)
+  robot_speaker.sh        voice to the real robot's USB speaker (GUI button Robot Speaker)
   install_host.sh         one-time host venv
   voice_sampler           hear the robot voices
   push_to_talk            keyboard switch for --push-to-talk (/realtime/talk)
