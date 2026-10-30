@@ -241,7 +241,11 @@ same way.
 **Robot speaker** (`scripts/robot_speaker.sh`, GUI button "Robot Speaker",
 real robot only: `route:=on`). The voice goes to a laptop null sink
 `mobipick_robot` whose monitor is streamed with `parec | ssh robot pacat`
-into the robot's USB speaker; a dead pipe is restarted. After a network drop
+into the robot's USB speaker. It needs `pactl` and `parec` on the laptop and
+`pacat` on the robot (`sudo apt install pulseaudio-utils`) and exits at once
+with that install hint when one is missing. A dead pipe is restarted: at once
+when it had run for 10 s or more, otherwise after 2, 4, 8, 16, 30 s, and after
+8 failed starts in a row the script gives up with an error. After a network drop
 the robot-side pacat of the old pipe can keep running (its ssh is gone, it
 never gets EOF), and on 2026-09-28 the robot stayed silent next to the new
 one (#187). `clean:=on` (or `ROBOT_SPEAKER_CLEAN=1`, default off until tested

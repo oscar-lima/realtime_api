@@ -41,10 +41,24 @@ if [ "$CLEAN" = on ]; then
   echo "clean:=on: earlier robot-side pacat of this script are killed before each start and on stop"
 fi
 robot() { timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=5 "$ROBOT" "$@"; }
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Without these the pipe dies every 2 s and the old script restarted it forever with no hint why.
+missing=()
+for tool in pactl:pulseaudio-utils parec:pulseaudio-utils ssh:openssh-client timeout:coreutils; do
+  command -v "${tool%%:*}" >/dev/null || missing+=("$tool")
+done
+if [ ${#missing[@]} -gt 0 ]; then
+  pkgs=$(printf '%s\n' "${missing[@]#*:}" | sort -u | tr '\n' ' ')
+  fail "robot speaker routing needs programs that are missing on this PC: ${missing[*]%%:*}. Install them with: sudo apt install ${pkgs% }"
+fi
+pactl info >/dev/null 2>&1 \
+  || fail "pactl cannot reach a sound server on this PC (PulseAudio or PipeWire with pipewire-pulse); check 'pactl info'"
 
 mod=$(pactl list short modules | awk -v s="sink_name=$SINK" '$0 ~ s {print $1}')
 if [ -z "$mod" ]; then
-  mod=$(pactl load-module module-null-sink sink_name=$SINK sink_properties=device.description=$SINK)
+  mod=$(pactl load-module module-null-sink sink_name=$SINK sink_properties=device.description=$SINK) \
+    && [ -n "$mod" ] || fail "could not load the null sink $SINK on this PC (pactl load-module module-null-sink failed)"
   echo "loaded null sink $SINK (module $mod)"
 fi
 pipe_pid=
@@ -59,7 +73,7 @@ cleanup() {
     robot "pkill -f '$OURS'" 2>/dev/null   # a half-open ssh leaves the robot's pacat waiting for more audio
   fi
   echo "robot speaker routing stopped (null sink $SINK unloaded, voice back on the laptop)"
-  exit 0
+  exit "${1:-0}"
 }
 trap cleanup INT TERM HUP
 
@@ -67,6 +81,7 @@ start_pipe() {
   ( parec -d $SINK.monitor "${FMT[@]}" --latency-msec=40 \
       | ssh -o BatchMode=yes -o ServerAliveInterval=5 "$ROBOT" "$REMOTE" ) &
   pipe_pid=$!
+  pipe_started=$SECONDS
   check_at=$((SECONDS + 3))
   echo "$(date +%T) audio pipe to $ROBOT started (pid $pipe_pid)"
 }
@@ -85,9 +100,30 @@ check_robot() {  # clean:=on: exactly one pacat of ours plays on the robot
     echo "$(date +%T) killed the older ones, keeping the newest"
   fi
 }
+# A pipe that dies within PIPE_MIN_S counts as a failed start; restarts back off 2, 4, 8, 16, 30 s and the script gives
+# up after MAX_FAILS of them in a row (about 2 min), so a robot that is off or a broken setup ends with an error instead
+# of looping forever. A pipe that ran longer (a network drop mid-demo, #187) restarts at once and resets the count.
+PIPE_MIN_S=10
+MAX_FAILS=8
+fails=0
+restart_at=
 start_pipe
 while true; do
-  kill -0 $pipe_pid 2>/dev/null || { echo "$(date +%T) audio pipe died, restarting"; start_pipe; }
+  if [ -n "$pipe_pid" ] && ! kill -0 "$pipe_pid" 2>/dev/null; then
+    wait "$pipe_pid" 2>/dev/null
+    pipe_pid=
+    if [ $((SECONDS - pipe_started)) -ge $PIPE_MIN_S ]; then fails=0; else fails=$((fails + 1)); fi
+    if [ $fails -ge $MAX_FAILS ]; then
+      echo "$(date +%T) ERROR: audio pipe to $ROBOT failed $fails times in a row, each within ${PIPE_MIN_S} s; giving up." \
+        "Check that 'ssh $ROBOT' works without a password and that pacat is installed there (sudo apt install" \
+        "pulseaudio-utils); the messages above say what failed" >&2
+      cleanup 1
+    fi
+    delay=$(( fails == 0 ? 0 : (1 << fails) > 30 ? 30 : (1 << fails) ))
+    restart_at=$((SECONDS + delay))
+    echo "$(date +%T) audio pipe died, restarting in ${delay} s (failed starts in a row: $fails of $MAX_FAILS)"
+  fi
+  if [ -z "$pipe_pid" ] && [ "$SECONDS" -ge "$restart_at" ]; then start_pipe; fi
   if [ "$CLEAN" = on ] && [ -n "$check_at" ] && [ "$SECONDS" -ge "$check_at" ]; then
     check_at=
     check_robot
