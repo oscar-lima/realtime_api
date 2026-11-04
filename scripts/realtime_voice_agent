@@ -174,6 +174,14 @@ PHRASES = {
     "it": {"confirm": "{}?", "yes": "Va bene.", "no": "Va bene, lo ignoro."},
     "fr": {"confirm": "{} ?", "yes": "D'accord.", "no": "D'accord, je l'ignore."},
 }
+# Spoken at once when an utterance is passed on (--ack), so the person hears that the robot took it while the
+# agents think. Rotating, each well under a second of audio.
+ACK_PHRASES = {"en": ["Mm-hm, let me think.", "One moment.", "Understood."],
+               "es": ["Mm-hm, déjame pensar.", "Un momento.", "Entendido."],
+               "de": ["Mm-hm, ich überlege.", "Einen Moment.", "Verstanden."],
+               "it": ["Mm-hm, ci penso.", "Un momento.", "Capito."],
+               "fr": ["Mm-hm, je réfléchis.", "Un instant.", "Compris."]}
+ACK_MODES = ("off", "always", "questions")
 # An order waits for its yes until the person had CONFIRM_REPLY_S of quiet after the robot's last sentence (the
 # question, or whatever it said after it), and at most CONFIRM_MAX_S after the order; other talk keeps it waiting.
 CONFIRM_REPLY_S = 15.0
@@ -441,6 +449,9 @@ def parse_args() -> argparse.Namespace:
                    help="English: read an order back as 'Shall I pick the relay?' instead of 'Pick the relay?' "
                         "(default on by the user's order; --no-natural-confirm or REALTIME_NATURAL_CONFIRM=0 "
                         "gives the old form)")
+    p.add_argument("--ack", choices=ACK_MODES, default=os.environ.get("REALTIME_ACK", "off"),
+                   help="say 'Mm-hm, let me think.' at once when an utterance is passed on: always, or only for "
+                        "questions (quieter in a crowded room); not for an order that is read back (default off)")
     p.add_argument("--push-to-talk", action="store_true", default=os.environ.get("REALTIME_PUSH_TO_TALK", "0") == "1",
                    help="send the mic only while true is published on --talk-topic (e.g. scripts/push_to_talk), so "
                         "during a public demo only the operator is heard (default off)")
@@ -497,6 +508,7 @@ class VoiceAgent:
         self._line_open = False
         self._busy = False
         self._asked_at = 0.0     # when the agents last asked the person a question
+        self._ack_n = 0
         self._pending = ""       # order waiting for the person's yes
         self._pending_at = 0.0
         self._reasked = False    # the order was asked a second time already
@@ -578,7 +590,7 @@ class VoiceAgent:
             self._pending = ""
             # the planner misread a lone "cancela" as unclear: give it the English word too
             english = all(STOP_RE.match(w) is None or w in ENGLISH_STOPS for w in words_of(text))
-            self._pass_on(text if english else f"stop ({text})")
+            self._pass_on(text if english else f"stop ({text})", ack=False)
             return
         pending = self._pending_order()
         if self._pending and not pending:
@@ -591,7 +603,7 @@ class VoiceAgent:
                 text = rest  # "yes, pick the sugar box": a new wording, confirm that instead
             else:
                 self._pending = ""
-                self._pass_on(pending)
+                self._pass_on(pending, ack=False)  # the "Okay." below is the reaction
                 self._say_self(PHRASES[self.language]["yes"])
                 return
         elif verdict == "no":
@@ -653,7 +665,7 @@ class VoiceAgent:
         phrase = PHRASES[self.language]["confirm"]
         self._say_self(phrase.format(read_back(order, self.language)), own=phrase.format(""))
 
-    def _pass_on(self, text: str) -> None:
+    def _pass_on(self, text: str, ack: bool = True) -> None:
         # Idle: a request that starts a workflow. While an order runs: an
         # event for it (mobipick_api's HRI buffers /recognized_speech, the
         # planner reads it with check_for_events() and listen() takes it as
@@ -661,6 +673,20 @@ class VoiceAgent:
         self._print(f"  -> {'event' if self._busy else 'request'}: {text}")
         self._stamp("recognized_speech_sent")
         self.ros.publish(self.args.goal_topic, text)
+        if ack:
+            self._acknowledge(text)
+
+    def _acknowledge(self, text: str) -> None:
+        """Say "Mm-hm, let me think." at once (--ack): not over a running voice, not for room talk (--ack questions)."""
+        mode = getattr(self.args, "ack", "off")
+        if mode == "off" or self._speaking:
+            return
+        if mode == "questions" and not (is_question(text, self.language) or text.rstrip().endswith("?")):
+            return
+        phrases = ACK_PHRASES[self.language]
+        self._ack_n += 1
+        self._say_self(phrases[self._ack_n % len(phrases)])
+
 
     def _say_self(self, text: str, own: str = "") -> None:
         """Say ``text``; ``own`` is the part that is the robot's own words (the rest quotes the person)."""

@@ -356,3 +356,10 @@ config/litellm_realtime.yaml
 - **While an order runs**, mobipick_gpt starts no new workflow; your words
   reach the running order as events, so "cancel" works when the planner
   checks for events between actions.
+
+## Acknowledgement, fast greeting and pass-through (bridge mode, all off by default)
+
+- `--ack always|questions` (env `REALTIME_ACK`): when an utterance is passed on, the robot says at once "Mm-hm, let
+  me think." / "One moment." / "Understood." (rotating, in the person's language) while the agents think. Not for an
+  order that is read back (that question is the reaction), not after a yes ("Okay."), not for a stop, not while the
+  robot is speaking. `questions` keeps room talk silent.

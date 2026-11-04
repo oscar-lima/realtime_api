@@ -34,6 +34,7 @@ def make_agent(rva, languages="en,de,es"):
     agent.args = types.SimpleNamespace(no_confirm=False, goal_topic="/recognized_speech",
                                        transcription_hint="", languages=languages)
     agent.out = []
+    agent._ack_n = 0
     agent.ros = types.SimpleNamespace(
         publish=lambda topic, text: topic == "/recognized_speech" and agent.out.append(("pass", text)))
     agent.voice.say = lambda text: agent.out.append(("say", text))
@@ -468,6 +469,41 @@ def test_questions_sentence_wise_after_a_greeting_and_past_tense_without_a_quest
     assert talk(agent, "Could you pick the relay?") == [("say", "Could you pick the relay?")]
     assert talk(agent, "Is the relay on table 2") == [("pass", "Is the relay on table 2")]  # no verb: no confirm
     assert talk(agent, "Is the relay on table 2?") == [("pass", "Is the relay on table 2?")]
+
+
+def test_acknowledgement_is_off_by_default_and_speaks_before_the_answer_when_on(rva):
+    agent = make_agent(rva)
+    assert talk(agent, "Who built you?") == [("pass", "Who built you?")]  # --ack off: nothing extra
+    for mode in ("always", "questions"):
+        agent = make_agent(rva)
+        agent.args.ack = mode
+        out = talk(agent, "Who built you?")
+        assert out[0] == ("pass", "Who built you?") and out[1][0] == "say" and out[1][1] in rva.ACK_PHRASES["en"], mode
+    agent = make_agent(rva)
+    agent.args.ack = "always"
+    assert [o[0] for o in talk(agent, "The weather is nice")] == ["pass", "say"]  # statements too
+    agent.args.ack = "questions"
+    assert talk(agent, "The weather is nice") == [("pass", "The weather is nice")]  # room talk stays silent
+    agent.args.ack = "always"
+    agent._speaking = True
+    assert talk(agent, "Who built you?") == [("pass", "Who built you?")]  # not over a running voice
+
+
+def test_acknowledgement_never_doubles_the_reaction_to_an_order_or_a_stop(rva):
+    agent = make_agent(rva)
+    agent.args.ack = "always"
+    assert talk(agent, "pick the coke") == [("say", "Pick the coke?")]  # the read-back is the reaction
+    assert talk(agent, "yes") == [("pass", "pick the coke"), ("say", "Okay.")]
+    assert [o[0] for o in talk(agent, "stop")] == ["pass"]
+    agent.language = "de"
+    assert rva.ACK_PHRASES["de"][1] == "Einen Moment."
+
+
+def route(agent, uid, verdict="chat_static"):
+    import json
+    agent.out = []
+    agent._on_route(json.dumps({"id": uid, "verdict": verdict}))
+    return agent.out
 
 
 def test_a_long_custom_hint_heard_back_whole_is_still_dropped_as_a_leak(rva):
