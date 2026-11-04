@@ -794,7 +794,7 @@ class VoiceAgent:
         if self.args.meter:
             start_meter(self.engine, self.stop)
         print(f"Mobipick voice agent ready (voice {self.args.voice}, echo canceller {self.engine.aec.name}, "
-              f"barge-in {self.args.barge_in}). Tasks go to {self.args.goal_topic}, {self.args.speak_topic} is "
+              f"barge-in {self.args.barge_in}, turn end {self.args.vad}/{self.args.vad_eagerness}). Tasks go to {self.args.goal_topic}, {self.args.speak_topic} is "
               "spoken. Ctrl-C to quit.", flush=True)
         if self.args.push_to_talk:
             print(f"push-to-talk: the mic is closed until true arrives on {self.args.talk_topic} "

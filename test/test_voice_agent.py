@@ -499,3 +499,13 @@ def test_voice_marks_find_start_and_end_of_voice_by_our_own_level():
     seen += [marks.feed(-80.0, 1.02 + i / 100) for i in range(VOICE_GAP_FRAMES)]
     assert [s for s in seen if s] == ["start", "end"]
     assert marks.last_voice == 1.01  # the end carries the time of the last loud frame
+
+
+def test_turn_end_eagerness_defaults_to_high_and_low_stays_selectable(monkeypatch):
+    import argparse
+    from realtime_api.app import add_api_args
+    monkeypatch.delenv("REALTIME_VAD_EAGERNESS", raising=False)
+    p = argparse.ArgumentParser()
+    add_api_args(p)
+    assert p.parse_args([]).vad_eagerness == "high"
+    assert p.parse_args(["--vad-eagerness", "low"]).vad_eagerness == "low"

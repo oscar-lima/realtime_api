@@ -199,8 +199,9 @@ as the answer to its question in `listen()`. Noise transcribed as filler or
 non-Latin text, a leaked transcription hint and the robot's own recent
 sentences are dropped (an echo repeats the robot's words in its order, so an
 answer that reuses them, "Pick the Pringles." to "... should I pick them
-up?", is kept). Turn detection is semantic VAD with `low` eagerness, which
-waits for complete sentences; it has no pre-roll setting (server VAD keeps
+up?", is kept). Turn detection is semantic VAD with `high` eagerness (answers about 2 s
+after you stop, may cut in at a pause; `low` waits for complete
+sentences but took ~9 s for "Hi Mobipick"); it has no pre-roll setting (server VAD keeps
 300 ms before the speech).
 
 **Push-to-talk** (`--push-to-talk`, `REALTIME_PUSH_TO_TALK=1`, or

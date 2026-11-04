@@ -32,8 +32,10 @@ def add_api_args(p: argparse.ArgumentParser) -> None:
     api.add_argument("--language", default="",
                      help="language hint for the user transcript ('' = auto-detect)")
     api.add_argument("--vad", choices=["semantic_vad", "server_vad"], default="semantic_vad")
-    api.add_argument("--vad-eagerness", choices=["low", "medium", "high", "auto"], default="low",
-                     help="low waits for complete sentences (fewer misheard fragments)")
+    api.add_argument("--vad-eagerness", choices=["low", "medium", "high", "auto"], default=os.environ.get("REALTIME_VAD_EAGERNESS", "high"),
+                     help="how fast the server ends your turn: low waits for complete sentences (fewer misheard "
+                          "fragments) but may wait up to ~8 s after a short phrase such as 'Hi Mobipick'; medium "
+                          "~4 s, high ~2 s at most but may cut in at a pause inside a sentence (env REALTIME_VAD_EAGERNESS, default high)")
     api.add_argument("--instructions-file", default="")
     api.add_argument("--transcription-model", default=os.environ.get("REALTIME_TRANSCRIPTION_MODEL",
                                                                      "gpt-4o-transcribe"),

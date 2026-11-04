@@ -21,6 +21,7 @@ for arg in "$@"; do
     # for GUI dropdowns not in the button profile yet (#190)
     voice_push_to_talk:=on) args+=(--push-to-talk) ;;
     voice_push_to_talk:=*) ;;
+    voice_vad_eagerness:=*) args+=(--vad-eagerness "${arg#voice_vad_eagerness:=}") ;;
     voice_barge_in:=*) args+=(--barge-in "${arg#voice_barge_in:=}") ;;
     *) args+=("$arg") ;;
   esac
