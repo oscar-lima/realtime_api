@@ -378,3 +378,52 @@ def test_a_silent_session_is_probed_and_replaced(rva, monkeypatch):
     thread.join(3)
     assert result == [0] and len(server.connections) == 2
 
+
+
+def test_a_lone_hello_is_valid_input(rva):
+    agent = make_agent(rva)
+    assert talk(agent, "Hello?") == [("pass", "Hello?")]
+    assert talk(agent, "Haha") == []  # other lone words stay ignored
+
+
+def test_misheard_robot_name_is_fixed_and_not_read_back_as_an_order(rva):
+    agent = make_agent(rva)
+    assert talk(agent, "Hi my pick") == [("pass", "Hi Mobipick")]
+    assert talk(agent, "Hi Myopic.") == [("pass", "Hi Mobipick.")]
+    assert talk(agent, "pick up my pick") == [("say", "Pick up my pick?")]  # not behind a greeting: an order
+
+
+def test_the_name_alone_is_a_greeting_passed_on_like_hello(rva):
+    agent = make_agent(rva)
+    assert talk(agent, "Mobipick") == [("pass", "Mobipick")]
+    assert talk(agent, "Myopic.") == [("pass", "Mobipick.")]  # misheard name, fixed first
+    assert talk(agent, "Hello") == [("pass", "Hello")]
+    assert talk(agent, "Soup") == []  # other lone words stay noise
+
+
+def test_default_transcription_hint_is_the_robot_name_and_noise_or_short_answers_pass_unchanged(rva):
+    assert rva.TRANSCRIPTION_HINT.startswith("Mobipick")
+    agent = make_agent(rva)
+    agent.args.transcription_hint = rva.TRANSCRIPTION_HINT
+    assert talk(agent, "Mobipick.") == [("pass", "Mobipick.")]  # the name alone is a greeting
+    assert talk(agent, "Agarra el azúcar.") == [("say", "¿Agarra el azúcar?")]
+    assert talk(agent, "sí") == [("pass", "Agarra el azúcar"), ("say", "Vale.")]  # not turned into "soup"
+    assert talk(agent, "Hi Mobipick") == [("pass", "Hi Mobipick")]
+
+
+def test_the_hint_is_the_name_alone_and_a_name_heard_for_a_yes_is_not_an_answer(rva):
+    hint = rva.TRANSCRIPTION_HINT
+    assert rva.words_of(hint) == ["mobipick"]  # the name alone: a long word list made the model echo it (2026-11-04)
+    agent = make_agent(rva)
+    agent.args.transcription_hint = hint
+    assert talk(agent, "Pick the tennis ball.") == [("say", "Pick the tennis ball?")]
+    # the yes heard as the name: asked again once, not passed on and not taken as the answer
+    assert talk(agent, "Mobipick") == [("say", "Pick the tennis ball?")]
+    assert talk(agent, "Yep") == [("pass", "Pick the tennis ball"), ("say", "Okay.")]
+
+
+def test_a_long_custom_hint_heard_back_whole_is_still_dropped_as_a_leak(rva):
+    agent = make_agent(rva)
+    agent.args.transcription_hint = "Mobipick. affirmative, bitte, bonjour, correct, hello, nope, yeah, yup."
+    assert talk(agent, "affirmative, bitte, bonjour, correct, hello, nope, yeah, yup.") == []
+    assert talk(agent, "Hello") == [("pass", "Hello")]

@@ -90,10 +90,12 @@ BRIDGE_INSTRUCTIONS = (
     "you only read aloud, exactly as written and in a natural friendly tone, the sentences you are asked to say."
 )
 
-# Optional prompt for the transcription model (--transcription-hint). Off by default: an English
-# word list turned short Spanish and German answers into listed objects ("sí" -> "soup"), and
-# the transcription sometimes returned the hint itself for noise.
-TRANSCRIPTION_HINT = ""
+# Prompt for the transcription model (--transcription-hint): the robot name and the short replies, so "Hi Mobipick"
+# is not heard as "Hi Myopic". On by default because oscar ordered it
+# (2026-11-03); switch off with --transcription-hint "" or REALTIME_TRANSCRIPTION_HINT= (empty). A long English
+# object list turned short Spanish and German answers into objects ("sí" -> "soup"): the hint holds no objects,
+# only the name. fix_robot_name stays the second line.
+# (TRANSCRIPTION_HINT is built below from the word sets, after GREETINGS.)
 
 FILLER = {"mm", "mhm", "hm", "hmm", "uh", "um", "ah", "eh", "oh", "uh-huh", "mm-hmm"}
 # English, Spanish and German, so the person can switch language mid session
@@ -302,6 +304,25 @@ def as_command(text: str) -> str:
     return re.sub(r"[\s.!?¿¡,;:]+$", "", text).strip() or text.strip()
 
 
+# A lone greeting is a valid input ("Hello" greets the robot), unlike other lone words, which are mostly noise.
+GREETINGS = {"hello", "hi", "hey", "hallo", "hola", "ciao", "bonjour"}
+# The hint is the name alone. A ~50-word hint with the yes, no and greeting words made the model echo the whole list
+# for a quiet "Hello" (voice test 3, 2026-11-04). A name heard for a yes ("yep" -> "Mobipick") is caught after the
+# transcription instead: while an order waits for its answer the name is no answer and the question is asked again
+# (see _pending_order). No objects, so "sí" stays "sí". A hint heard back whole is dropped as a leak.
+TRANSCRIPTION_HINT = "Mobipick."
+# The robot's name as the transcription mishears it ("Hi Myopic", "Hi my pick"). "my pick" is only taken for the
+# name right behind a greeting: "pick up my pick" must stay an order.
+_NAME_RE = re.compile(r"\b(myopic|mobi[\s-]+pick|moby[\s-]+pick|mobile[\s-]+pick|mobipic|mobypick|mobypic)\b", re.I)
+_GREETED_NAME_RE = re.compile(r"\b(hi|hello|hey|hallo|hola)([\s,]+)(my[\s-]+pick)\b", re.I)
+
+
+def fix_robot_name(text: str) -> str:
+    """Write a misheard robot name as "Mobipick", so it is neither read back as an order ("pick") nor lost."""
+    text = _GREETED_NAME_RE.sub(lambda m: m.group(1) + m.group(2) + "Mobipick", text)
+    return _NAME_RE.sub("Mobipick", text)
+
+
 LEAD_RE = re.compile(r"^\W*((yes|yeah|ok|okay|sí|si|vale|claro|ja|genau|also|so|now|well|alright|and|then|ahora|pues|"
                      r"jetzt|und|dann)\b[\s,.!]*)+", re.I)
 
@@ -355,7 +376,7 @@ def parse_args() -> argparse.Namespace:
                    help="languages the person may use (default en: English only, the transcription is told to "
                         "expect English); utterances in other languages are ignored")
     p.add_argument("--transcription-hint", default=os.environ.get("REALTIME_TRANSCRIPTION_HINT", TRANSCRIPTION_HINT),
-                   help="prompt for the transcription model, e.g. expected object names (default: none)")
+                   help="prompt for the transcription model (default: the robot's name 'Mobipick' alone; '' switches it off)")
     p.add_argument("--push-to-talk", action="store_true", default=os.environ.get("REALTIME_PUSH_TO_TALK", "0") == "1",
                    help="send the mic only while true is published on --talk-topic (e.g. scripts/push_to_talk), so "
                         "during a public demo only the operator is heard (default off)")
@@ -446,6 +467,7 @@ class VoiceAgent:
             return
         if not is_speech(text):
             return
+        text = fix_robot_name(text)
         if self.args.transcription_hint and overlaps(text, self.args.transcription_hint, share=0.8, min_words=6):
             self._print("  x  ignored: the transcription hint leaked in")
             return
@@ -523,7 +545,7 @@ class VoiceAgent:
         # lone verb such as "navegar" is a command and still confirmed).
         answering = self._busy and self._clock() - self._asked_at < ANSWER_WINDOW_S
         lone = len(words_of(text)) == 1 and not answering \
-            and words_of(text)[0] not in (YES_WORDS - WEAK_YES) | NO_WORDS
+            and words_of(text)[0] not in (YES_WORDS - WEAK_YES) | NO_WORDS | GREETINGS | {"mobipick"}
         if lone and not is_command(text, self.language):
             self._print(f"  x  ignored lone word: {text}")
             return
