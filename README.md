@@ -368,3 +368,13 @@ config/litellm_realtime.yaml
   Mobipick. How can I help you?" / "Hi, I'm listening.", in the person's language) and is not passed on: no
   acknowledgement, no planner reply about two seconds later. Not while an order runs, not while an order waits for a
   yes; a greeting with more words ("Hi Mobipick, who built you?") goes on as before.
+- `--passthrough static_chat` (env `REALTIME_PASSTHROUGH`): the realtime model answers small talk and questions about
+  the robot itself, from the static facts of `chatbot.txt`, instead of the chatbot. The router decides and
+  publishes a verdict; the voice agent publishes each passed-on utterance and takes the verdict:
+  - `/realtime/utterance` (voice agent -> router): JSON `{"id": "<tag>-<n>", "text": "..."}`, only with the flag on.
+  - `/mobipick_gpt/route` (router -> voice agent, `--route-topic`): JSON `{"id": "...", "verdict":
+    "chat_static" | "chat_live" | "task"}`. Only `chat_static` is acted on; stale (older than 10 s or not the latest
+    utterance), used, or while an order runs: dropped.
+  - `/realtime/route_ack` (voice agent -> router, `--route-ack-topic`): JSON `{"id": "...", "taking": true}` when the
+    voice agent answers. The chatbot must stay silent only after this ack; without it (voice agent down, verdict
+    dropped, about 3 s) the chatbot answers as before.

@@ -34,10 +34,12 @@ def make_agent(rva, languages="en,de,es"):
     agent.args = types.SimpleNamespace(no_confirm=False, goal_topic="/recognized_speech",
                                        transcription_hint="", languages=languages)
     agent.out, agent.published = [], []
-    agent._ack_n = 0
+    agent._utt_n, agent._utterances, agent._ack_n, agent._session_tag = 0, {}, 0, "t"
+    agent._passthrough_instructions = ""
     agent.ros = types.SimpleNamespace(
         publish=lambda topic, text: (agent.published.append((topic, text)),
                                      topic == "/recognized_speech" and agent.out.append(("pass", text))))
+    agent.voice.answer = lambda instructions: agent.out.append(("answer", instructions))
     agent.voice.say = lambda text: agent.out.append(("say", text))
     agent.voice.interrupt = lambda reason="": agent._speaking and agent.out.append(("interrupt", reason))
     agent._print = lambda line: None
@@ -505,6 +507,44 @@ def route(agent, uid, verdict="chat_static"):
     agent.out = []
     agent._on_route(json.dumps({"id": uid, "verdict": verdict}))
     return agent.out
+
+
+def test_passthrough_answers_only_the_router_s_static_chat_verdict_for_the_latest_utterance(rva):
+    agent = make_agent(rva)
+    agent.args.passthrough = "static_chat"
+    agent.args.utterance_topic, agent.args.route_ack_topic = "/realtime/utterance", "/realtime/route_ack"
+    agent._passthrough_instructions = "FACTS"
+    talk(agent, "Who built you?")
+    utt = [m for t, m in agent.published if t == "/realtime/utterance"]
+    assert len(utt) == 1 and '"id": "t-1"' in utt[0]
+    assert route(agent, "t-1", "chat_live") == [] and route(agent, "t-1", "task") == []
+    assert route(agent, "nope") == []  # unknown id
+    assert route(agent, "t-1") == [("answer", "FACTS")]
+    assert agent.published[-1] == ("/realtime/route_ack", '{"id": "t-1", "taking": true}')
+    assert route(agent, "t-1") == []  # used once
+    # a stale verdict (older utterance than the latest) and one arriving too late are dropped
+    talk(agent, "What is DFKI?")
+    talk(agent, "Where are you from?")
+    assert route(agent, "t-2") == [] and route(agent, "t-3") == [("answer", "FACTS")]
+    talk(agent, "Who is your developer?")
+    agent.now += rva.ROUTE_TTL_S + 1
+    assert route(agent, "t-4") == []
+    # while an order runs the side chat answers, and with the flag off or no facts the chatbot does
+    talk(agent, "Who built you?")
+    agent._busy = True
+    assert route(agent, "t-5") == []
+    agent._busy = False
+    agent._passthrough_instructions = ""
+    assert route(agent, "t-5") == []
+    agent.args.passthrough = "off"
+    agent._passthrough_instructions = "FACTS"
+    assert route(agent, "t-5") == []
+
+
+def test_passthrough_off_publishes_no_utterance_id(rva):
+    agent = make_agent(rva)
+    talk(agent, "Who built you?")
+    assert "/realtime/utterance" not in [t for t, _ in agent.published]
 
 
 def test_a_long_custom_hint_heard_back_whole_is_still_dropped_as_a_leak(rva):

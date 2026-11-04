@@ -60,7 +60,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from realtime_api.app import (  # noqa: E402
     add_api_args, add_audio_args, connect, make_engine, save_debug, save_echo_delay, start_meter,
 )
-from realtime_api.mobipick_prompt import DEFAULT_PROMPT_DIR, build_instructions  # noqa: E402
+from realtime_api.mobipick_prompt import DEFAULT_PROMPT_DIR, build_instructions, passthrough_instructions  # noqa: E402
 from realtime_api.realtime_client import RealtimeClient, build_session, resolve_endpoint  # noqa: E402
 from realtime_api.ros_bridge import RosStringBridge, remember_rosbridge_url, rosbridge_url  # noqa: E402
 from realtime_api.voice_session import VoiceSession  # noqa: E402
@@ -182,6 +182,7 @@ ACK_PHRASES = {"en": ["Mm-hm, let me think.", "One moment.", "Understood."],
                "it": ["Mm-hm, ci penso.", "Un momento.", "Capito."],
                "fr": ["Mm-hm, je réfléchis.", "Un instant.", "Compris."]}
 ACK_MODES = ("off", "always", "questions")
+PASSTHROUGH_MODES = ("off", "static_chat")
 # Said at once to a bare greeting or the robot's name alone ("Hi Mobipick", "Hello", "Mobipick") with
 # --fast-greeting, instead of an acknowledgement plus the planner's reply about two seconds later.
 GREETING_REPLIES = {"en": ["Hello, I am Mobipick. How can I help you?", "Hi, I'm listening."],
@@ -189,6 +190,8 @@ GREETING_REPLIES = {"en": ["Hello, I am Mobipick. How can I help you?", "Hi, I'm
                     "de": ["Hallo, ich bin Mobipick. Wie kann ich helfen?", "Hallo, ich höre zu."],
                     "it": ["Ciao, sono Mobipick. Come posso aiutarti?", "Ciao, ti ascolto."],
                     "fr": ["Bonjour, je suis Mobipick. Comment puis-je vous aider ?", "Bonjour, je vous écoute."]}
+ROUTE_TTL_S = 10.0  # a router verdict older than this belongs to a stale utterance and is dropped
+
 # An order waits for its yes until the person had CONFIRM_REPLY_S of quiet after the robot's last sentence (the
 # question, or whatever it said after it), and at most CONFIRM_MAX_S after the order; other talk keeps it waiting.
 CONFIRM_REPLY_S = 15.0
@@ -465,11 +468,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ack", choices=ACK_MODES, default=os.environ.get("REALTIME_ACK", "off"),
                    help="say 'Mm-hm, let me think.' at once when an utterance is passed on: always, or only for "
                         "questions (quieter in a crowded room); not for an order that is read back (default off)")
+    p.add_argument("--passthrough", choices=PASSTHROUGH_MODES,
+                   default=os.environ.get("REALTIME_PASSTHROUGH", "off"),
+                   help="static_chat: when the router says chat_static (small talk, questions about the robot, "
+                        "needing no live knowledge) the realtime model answers itself and the chatbot stays "
+                        "silent; needs a router that publishes --route-topic (default off)")
     p.add_argument("--fast-greeting", action="store_true",
                    default=os.environ.get("REALTIME_FAST_GREETING", "0") == "1",
                    help="answer a bare greeting or the robot's name alone ('Hi Mobipick', 'Hello', 'Mobipick') "
                         "at once with a fixed sentence instead of passing it to the planner, which takes about "
                         "two seconds; only while idle and with no order waiting for a yes (default off)")
+    ros.add_argument("--route-topic", default="/mobipick_gpt/route")
+    ros.add_argument("--utterance-topic", default="/realtime/utterance")
+    ros.add_argument("--route-ack-topic", default="/realtime/route_ack")
     p.add_argument("--push-to-talk", action="store_true", default=os.environ.get("REALTIME_PUSH_TO_TALK", "0") == "1",
                    help="send the mic only while true is published on --talk-topic (e.g. scripts/push_to_talk), so "
                         "during a public demo only the operator is heard (default off)")
@@ -526,7 +537,11 @@ class VoiceAgent:
         self._line_open = False
         self._busy = False
         self._asked_at = 0.0     # when the agents last asked the person a question
+        self._utt_n = 0          # passed-on utterances, numbered for the router verdicts (--passthrough)
+        self._utterances: "dict[str, tuple[float, str]]" = {}  # id -> (time, text), until answered or stale
         self._ack_n = 0
+        self._session_tag = format(int(time.time()) % 0xFFFFFF, "x")  # a restart never reuses an utterance id
+        self._passthrough_instructions = ""
         self._pending = ""       # order waiting for the person's yes
         self._pending_at = 0.0
         self._reasked = False    # the order was asked a second time already
@@ -707,6 +722,13 @@ class VoiceAgent:
         # planner reads it with check_for_events() and listen() takes it as
         # an answer; the runner starts no new workflow then).
         self._print(f"  -> {'event' if self._busy else 'request'}: {text}")
+        if getattr(self.args, "passthrough", "off") != "off":
+            self._utt_n += 1
+            uid = f"{self._session_tag}-{self._utt_n}"
+            now = self._clock()
+            self._utterances = {k: v for k, v in self._utterances.items() if now - v[0] < ROUTE_TTL_S}
+            self._utterances[uid] = (now, text)
+            self.ros.publish(self.args.utterance_topic, json.dumps({"id": uid, "text": text}))
         self._stamp("recognized_speech_sent")
         self.ros.publish(self.args.goal_topic, text)
         if ack:
@@ -723,6 +745,31 @@ class VoiceAgent:
         self._ack_n += 1
         self._say_self(phrases[self._ack_n % len(phrases)])
 
+    def _on_route(self, raw: str) -> None:
+        """The router's verdict for a passed-on utterance (--passthrough static_chat): answer chat_static ourselves.
+
+        Dropped when it is stale, belongs to an older utterance than the latest, was used already, or while an
+        order runs (its side chat answers then). Taking it is announced on --route-ack-topic: only then does the
+        chatbot stay silent; without the announcement (voice agent down, dropped verdict) it answers as before.
+        """
+        if getattr(self.args, "passthrough", "off") != "static_chat":
+            return
+        try:
+            data = json.loads(raw)
+            uid, verdict = str(data["id"]), str(data["verdict"])
+        except (ValueError, KeyError, TypeError):
+            return
+        entry = self._utterances.get(uid)
+        if verdict != "chat_static" or entry is None or self._busy or not self._passthrough_instructions:
+            return
+        if self._clock() - entry[0] > ROUTE_TTL_S or uid != f"{self._session_tag}-{self._utt_n}":
+            self._utterances.pop(uid, None)
+            self._print(f"  x  stale router verdict dropped: {uid}")
+            return
+        self._utterances.pop(uid)
+        self._print(f"  ~  answering myself (chat_static): {entry[1]}")
+        self.ros.publish(self.args.route_ack_topic, json.dumps({"id": uid, "taking": True}))
+        self.voice.answer(self._passthrough_instructions)
 
     def _say_self(self, text: str, own: str = "") -> None:
         """Say ``text``; ``own`` is the part that is the robot's own words (the rest quotes the person)."""
@@ -795,6 +842,8 @@ class VoiceAgent:
             print(flush=True)
             self._line_open = False
         if text:
+            now = self._clock()  # an own answer (--passthrough) must not come back as the person's words
+            self._said = [(t, s) for t, s in self._said if now - t < 60] + [(now, text)]
             self.ros.publish("/realtime/robot_transcript", text)
 
     def _stamp(self, what: str, when: "float | None" = None) -> None:
@@ -852,6 +901,13 @@ class VoiceAgent:
         if self.args.push_to_talk:
             self.ros.subscribe_bool(self.args.talk_topic, self._on_talk)
             remember_rosbridge_url(self.args.rosbridge_url)
+        if self.args.passthrough != "off":
+            try:
+                self._passthrough_instructions = passthrough_instructions(self.args.prompt_dir)
+            except OSError as exc:
+                print(f"  !  --passthrough needs chatbot.txt in {self.args.prompt_dir} ({exc}): the chatbot "
+                      "answers everything", flush=True)
+            self.ros.subscribe(self.args.route_topic, self._on_route)
         threading.Thread(target=self._watch_speaking, daemon=True).start()
         if self.args.meter:
             start_meter(self.engine, self.stop)

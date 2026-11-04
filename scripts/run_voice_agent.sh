@@ -20,6 +20,8 @@ for arg in "$@"; do
     voice_languages:=*) langs="${arg#voice_languages:=}"; args+=(--languages "${langs//_/,}") ;;
     voice_ack:=off) ;;
     voice_ack:=*) args+=(--ack "${arg#voice_ack:=}") ;;
+    voice_passthrough:=true) args+=(--passthrough static_chat) ;;
+    voice_passthrough:=*) ;;
     voice_fast_greeting:=true) args+=(--fast-greeting) ;;
     voice_fast_greeting:=*) ;;
     # for GUI dropdowns not in the button profile yet (#190)

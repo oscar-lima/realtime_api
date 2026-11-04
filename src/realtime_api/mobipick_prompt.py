@@ -50,3 +50,18 @@ def build_instructions(prompt_dir: str = DEFAULT_PROMPT_DIR, template_file: str 
         with open(chatbot) as handle:
             knowledge = chatbot_knowledge(handle.read())
     return template.replace(KNOWLEDGE_MARKER, knowledge).strip()
+
+
+PASSTHROUGH_INSTRUCTIONS = (
+    "You are Mobipick, a mobile manipulation robot, talking with a person. Answer the person's last words yourself, "
+    "in one or two short spoken sentences, in the language the person spoke. Use only the facts below. If they do "
+    "not cover it, say that you do not know. Never claim to see, hold or have done anything, and never promise to do "
+    "something: you only talk now.\n\nFacts about you:\n"
+)
+
+
+def passthrough_instructions(prompt_dir: str = DEFAULT_PROMPT_DIR) -> str:
+    """Instructions for an answer of the realtime model itself: the persona and the static facts, no tools."""
+    chatbot = os.path.join(prompt_dir, "chatbot.txt")
+    with open(chatbot) as handle:
+        return PASSTHROUGH_INSTRUCTIONS + chatbot_knowledge(handle.read())

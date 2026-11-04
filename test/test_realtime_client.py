@@ -274,3 +274,28 @@ def test_a_failed_reconnect_leaves_the_client_closed(monkeypatch):
     assert client.closed.is_set()
     client.send({"type": "input_audio_buffer.append"})  # silently dropped, no exception
 
+
+
+def test_a_passthrough_answer_is_in_the_conversation_queued_after_a_say_and_cut_off_by_a_barge_in():
+    client = make_client()
+    client.session_ready.set()
+    engine = FakeEngine()
+    session = VoiceSession(client, engine, speak_only=True)
+    session.say("Mm-hm, let me think.")
+    session.answer("ANSWER INSTRUCTIONS")  # queued behind the acknowledgement
+    assert client._ws.sent[-1]["response"]["metadata"] == {"source": "say"}
+    client._dispatch({"type": "response.created", "response": {"id": "r1", "metadata": {"source": "say"}}})
+    client._dispatch({"type": "response.done", "response": {"id": "r1", "output": []}})
+    request = client._ws.sent[-1]["response"]
+    assert request["metadata"] == {"source": "answer"} and request["instructions"] == "ANSWER INSTRUCTIONS"
+    assert "conversation" not in request and request["tool_choice"] == "none"
+    # the answer is let through (not cancelled), played, and a barge-in truncates and cancels it
+    sent = len(client._ws.sent)
+    client._dispatch({"type": "response.created", "response": {"id": "r2", "metadata": {"source": "answer"}}})
+    assert len(client._ws.sent) == sent
+    client._dispatch({"type": "response.output_audio.delta", "response_id": "r2", "item_id": "item_a",
+                      "delta": base64.b64encode(np.ones(10, dtype=np.int16).tobytes()).decode()})
+    assert engine.queued[-1][2] == "item_a"
+    assert session.interrupt("test")
+    types = [m["type"] for m in client._ws.sent[sent:]]
+    assert "conversation.item.truncate" in types and "response.cancel" in types

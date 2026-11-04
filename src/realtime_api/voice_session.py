@@ -233,7 +233,10 @@ class VoiceSession:
         self.response_active = False
         self.interruptions = 0
         self._interrupted: "set[str]" = set()  # items whose remaining audio must not play
-        self._say_queue: "collections.deque[str]" = collections.deque()
+        # sentences to say (str) and pass-through answers (("answer", instructions)), in the order they were asked
+        self._say_queue: "collections.deque[Any]" = collections.deque()
+        self._answer_ids: "set[str]" = set()    # responses that answer the person in the conversation (pass-through)
+        self._conv_items: "set[str]" = set()    # their audio items: a barge-in truncates and cancels these
         self.speak_only = speak_only
         self._rejected: "set[str]" = set()  # responses nobody asked for (speak_only)
         # speak_only: the person's language; say() translates into it when needed
@@ -300,10 +303,13 @@ class VoiceSession:
     def _on_response_created(self, event: Dict[str, Any]) -> None:
         self.response_active = True
         response = event.get("response", {})
-        if self.speak_only and (response.get("metadata") or {}).get("source") != "say":
+        source = (response.get("metadata") or {}).get("source")
+        if source == "answer":
+            self._answer_ids.add(response.get("id", ""))
+        if self.speak_only and source not in ("say", "answer"):
             self._rejected.add(response.get("id", ""))
             self.client.cancel_response(response.get("id", ""))  # not the sentence being said
-            _LOG.info("cancelled a response nobody asked for")
+            _LOG.debug("cancelled a response nobody asked for")
 
     def _muted(self, event: Dict[str, Any]) -> bool:
         return event.get("response_id", "") in self._rejected or event.get("item_id", "") in self._interrupted
@@ -322,6 +328,18 @@ class VoiceSession:
             return
         with self._lock:
             self._say_queue.append(text)
+            busy = self.response_active
+        if not busy:
+            self._flush_say()
+
+    def answer(self, instructions: str) -> None:
+        """Let the model answer the person's last words itself (pass-through, speak-only mode).
+
+        Unlike ``say`` the answer is in the conversation, so it sees what the person said. It goes through the same
+        queue as ``say``: an acknowledgement asked before it is spoken first, and nothing cuts a running answer off.
+        """
+        with self._lock:
+            self._say_queue.append(("answer", instructions))
             busy = self.response_active
         if not busy:
             self._flush_say()
@@ -346,6 +364,12 @@ class VoiceSession:
                 return  # a sentence waits for the next session instead of going into a closed socket
             text = self._say_queue.popleft()
             self.response_active = True  # until response.created/done arrive
+        if isinstance(text, tuple):
+            self.client.send({
+                "type": "response.create",
+                "response": {"metadata": {"source": "answer"}, "instructions": text[1], "tool_choice": "none"},
+            })
+            return
         if self.speak_only:
             self.client.send({
                 "type": "response.create",
@@ -383,6 +407,8 @@ class VoiceSession:
 
     def _on_audio_delta(self, event: Dict[str, Any]) -> None:
         # deltas of an interrupted answer can still be in flight: drop them
+        if event.get("response_id", "") in self._answer_ids and event.get("item_id"):
+            self._conv_items.add(event["item_id"])
         if self.on_event and event.get("item_id") != self._timed_item and not self._muted(event):
             self._timed_item = event.get("item_id", "")
             self.on_event("first_audio_out", event.get("_rx"))
@@ -447,9 +473,9 @@ class VoiceSession:
             self._interrupted.add(item)
         if item and item != "calibration":
             played = self.engine.playback.played_ms(item)
-            if not self.speak_only:  # out-of-band items are not in the conversation
+            if not self.speak_only or item in self._conv_items:  # out-of-band items are not in the conversation
                 self.client.truncate(item, played)
-                if self.barge_in != "any":
+                if self.barge_in != "any" or self.speak_only:
                     self.client.cancel_response()  # the server interrupts it only for "any"
             _LOG.info("barge-in: stopped robot speech after %d ms%s", played, f" ({reason})" if reason else "")
         return True
