@@ -393,6 +393,29 @@ def test_misheard_robot_name_is_fixed_and_not_read_back_as_an_order(rva):
     assert talk(agent, "pick up my pick") == [("say", "Pick up my pick?")]  # not behind a greeting: an order
 
 
+def test_natural_confirmation_is_phrased_as_a_question_when_on_and_old_form_when_off(rva):
+    agent = make_agent(rva)
+    assert talk(agent, "Pick the relay") == [("say", "Pick the relay?")]
+    agent = make_agent(rva)
+    agent.args.natural_confirm = True
+    assert talk(agent, "Pick the relay") == [("say", "Shall I pick the relay?")]
+    agent._pending = ""
+    assert talk(agent, "Could you please bring me the cup?") == [("say", "Shall I bring you the cup?")]
+    assert rva.natural_question("Go to table 2") == "Shall I go to table 2?"
+    assert rva.natural_question("The red cup") == ""
+
+
+def test_natural_confirmation_is_on_by_default_and_can_be_switched_off(rva, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["realtime_voice_agent"])
+    monkeypatch.delenv("REALTIME_NATURAL_CONFIRM", raising=False)
+    assert rva.parse_args().natural_confirm is True
+    monkeypatch.setattr("sys.argv", ["realtime_voice_agent", "--no-natural-confirm"])
+    assert rva.parse_args().natural_confirm is False
+    monkeypatch.setattr("sys.argv", ["realtime_voice_agent"])
+    monkeypatch.setenv("REALTIME_NATURAL_CONFIRM", "0")
+    assert rva.parse_args().natural_confirm is False
+
+
 def test_the_name_alone_is_a_greeting_passed_on_like_hello(rva):
     agent = make_agent(rva)
     assert talk(agent, "Mobipick") == [("pass", "Mobipick")]
@@ -420,6 +443,31 @@ def test_the_hint_is_the_name_alone_and_a_name_heard_for_a_yes_is_not_an_answer(
     # the yes heard as the name: asked again once, not passed on and not taken as the answer
     assert talk(agent, "Mobipick") == [("say", "Pick the tennis ball?")]
     assert talk(agent, "Yep") == [("pass", "Pick the tennis ball"), ("say", "Okay.")]
+
+
+def test_questions_are_answered_at_once_and_only_orders_are_confirmed(rva):
+    agent = make_agent(rva)
+    assert talk(agent, "Did you pick the coke?") == [("pass", "Did you pick the coke?")]
+    assert talk(agent, "Where did you put the coke?") == [("pass", "Where did you put the coke?")]
+    assert talk(agent, "¿Dónde dejaste la coca?") == [("pass", "¿Dónde dejaste la coca?")]
+    assert talk(agent, "Wo hast du die Cola hingestellt?") == [("pass", "Wo hast du die Cola hingestellt?")]
+    assert talk(agent, "Can you pick the coke?") == [("say", "Can you pick the coke?")]  # a polite order
+    assert talk(agent, "Pick the coke?") == [("say", "Pick the coke?")]
+
+
+def test_questions_sentence_wise_after_a_greeting_and_past_tense_without_a_question_mark(rva):
+    agent = make_agent(rva)
+    for text in ["Did you pick the relay", "What's on the table you inspected?", "What’s on the table you inspected?",
+                 "Mobipick, where did you put the relay?", "Hi Mobipick, what's on table 2?",
+                 "Wohin soll ich den Kasten stellen?", "Haben Sie die Kiste geholt?"]:
+        assert talk(agent, text) == [("pass", text)], text
+    assert talk(agent, "Where is the relay? Pick it.") == [("say", "Pick it?")]
+    assert talk(agent, "Is the relay on table 2? Pick it.") == [("say", "Pick it?")]
+    assert talk(agent, "How about you pick the relay?") == [("say", "How about you pick the relay?")]
+    assert talk(agent, "Pick the relay?") == [("say", "Pick the relay?")]
+    assert talk(agent, "Could you pick the relay?") == [("say", "Could you pick the relay?")]
+    assert talk(agent, "Is the relay on table 2") == [("pass", "Is the relay on table 2")]  # no verb: no confirm
+    assert talk(agent, "Is the relay on table 2?") == [("pass", "Is the relay on table 2?")]
 
 
 def test_a_long_custom_hint_heard_back_whole_is_still_dropped_as_a_leak(rva):

@@ -280,6 +280,49 @@ def is_command(text: str, language: str = "en") -> bool:
     return any(r.match(w) for w in words_of(text) for r in patterns)
 
 
+# A question is answered at once, never read back for a yes: only orders are confirmed. Judged sentence by sentence:
+# a turn is confirmed when any sentence that is not a question holds an action verb ("Where is the relay? Pick it."
+# -> "Pick it?"). A question is recognised by its first word, after a greeting or the robot's name ("Hi Mobipick,
+# what's on table 2?"): a wh-word, a past-tense auxiliary with "you" ("Did you pick the relay"), or a present one
+# with a "?" at the end ("Is the relay on table 2?"), also when it holds an action verb ("Where did you put the
+# coke?"). "How about you pick the relay?" is a suggestion, "Could you pick the relay?" and "Pick the coke?" stay
+# orders (an unconfirmed order moves the arm).
+_WH_WORDS = {"en": {"who", "what", "where", "when", "why", "how", "which", "whose", "whom", "what's", "where's",
+                    "who's", "how's", "when's", "why's", "which's"},
+             "es": {"quién", "quien", "qué", "dónde", "donde", "cuándo", "cuando", "por", "cómo", "como",
+                    "cuál", "cual", "cuánto", "cuanto"},
+             "de": {"wer", "was", "wo", "wann", "warum", "wie", "welche", "welcher", "welches", "wieso", "weshalb",
+                    "wohin", "woher"}}
+_AUX_WORDS = {"is", "are", "was", "were", "do", "does", "did", "have", "has", "had", "hast", "bist", "ist", "sind"}
+_PAST_AUX = {"en": {"did", "was", "were", "have", "has", "had"}, "de": {"haben", "hast", "hat", "hatten", "war", "waren"}}
+_YOU = {"en": {"you"}, "de": {"sie", "du", "ihr"}}
+_VOCATIVE_RE = re.compile(r"^\W*((hi|hello|hey|hallo|hola)\b[\s,.!]*|mobipick\b[\s,.!]*)+", re.I)
+
+
+def is_question(text: str, language: str = "en") -> bool:
+    text = _VOCATIVE_RE.sub("", text.strip())
+    words = words_of(text)
+    if not words:
+        return False
+    first = words[0]
+    if first in _WH_WORDS["en"] or (language != "en" and first in _WH_WORDS.get(language, set())):
+        if first in ("how", "what") and words[1:2] == ["about"]:
+            return False  # a suggestion: "How about you pick the relay?"
+        return not (first == "por" and words[1:2] != ["qué"])
+    for lang in ("en", "de"):
+        if lang != "en" and language != lang:
+            continue
+        if first in _PAST_AUX[lang] and words[1:2] and words[1] in _YOU[lang]:
+            return True
+    return first in _AUX_WORDS and text.rstrip().endswith("?")
+
+
+def is_order(text: str, language: str = "en") -> bool:
+    """Some sentence of the turn is not a question and holds an action verb: it is read back and needs a yes."""
+    return any(is_command(part, language) and not is_question(part, language)
+               for part in re.split(r"(?<=[.!?…])\s+", text.strip()))
+
+
 ENGLISH_STOPS = {"stop", "stopped", "stopping", "cancel", "cancelled", "canceled", "abort", "halt", "freeze"}
 
 
@@ -323,6 +366,21 @@ def fix_robot_name(text: str) -> str:
     return _NAME_RE.sub("Mobipick", text)
 
 
+_ASK_LEAD_RE = re.compile(r"^(please[\s,]+)?((can|could|would|will)\s+you\s+(please\s+)?)?(please[\s,]+)?", re.I)
+_PRONOUNS = {"me": "you", "my": "your", "mine": "yours", "myself": "yourself"}
+
+
+def natural_question(order: str) -> str:
+    """"Pick the relay" -> "Shall I pick the relay?", or '' when the order does not start with an action verb."""
+    text = _ASK_LEAD_RE.sub("", read_back(order, "en").strip())
+    text = re.sub(r"[\s.!?¿¡,;:]+$", "", text)
+    first = words_of(text)[:1]
+    if not first or not ACTION_RE["en"].match(first[0]):
+        return ""
+    text = re.sub(r"\b(me|my|mine|myself)\b", lambda m: _PRONOUNS[m.group(1).lower()], text, flags=re.I)
+    return f"Shall I {text[:1].lower()}{text[1:]}?"
+
+
 LEAD_RE = re.compile(r"^\W*((yes|yeah|ok|okay|sí|si|vale|claro|ja|genau|also|so|now|well|alright|and|then|ahora|pues|"
                      r"jetzt|und|dann)\b[\s,.!]*)+", re.I)
 
@@ -335,7 +393,7 @@ def read_back(order: str, language: str = "en") -> str:
     name the object: "The red cup. Bring it to me.").
     """
     sentences = re.split(r"(?<=[.!?…])\s+", order.strip())
-    start = next((i for i, part in enumerate(sentences) if is_command(part, language)), 0)
+    start = next((i for i, part in enumerate(sentences) if is_order(part, language)), 0)
     short = " ".join(sentences[start:])
     short = LEAD_RE.sub("", short).strip() or short
     return short[:1].upper() + short[1:]
@@ -377,6 +435,11 @@ def parse_args() -> argparse.Namespace:
                         "expect English); utterances in other languages are ignored")
     p.add_argument("--transcription-hint", default=os.environ.get("REALTIME_TRANSCRIPTION_HINT", TRANSCRIPTION_HINT),
                    help="prompt for the transcription model (default: the robot's name 'Mobipick' alone; '' switches it off)")
+    p.add_argument("--natural-confirm", action=argparse.BooleanOptionalAction,
+                   default=os.environ.get("REALTIME_NATURAL_CONFIRM", "1") != "0",
+                   help="English: read an order back as 'Shall I pick the relay?' instead of 'Pick the relay?' "
+                        "(default on by the user's order; --no-natural-confirm or REALTIME_NATURAL_CONFIRM=0 "
+                        "gives the old form)")
     p.add_argument("--push-to-talk", action="store_true", default=os.environ.get("REALTIME_PUSH_TO_TALK", "0") == "1",
                    help="send the mic only while true is published on --talk-topic (e.g. scripts/push_to_talk), so "
                         "during a public demo only the operator is heard (default off)")
@@ -549,7 +612,7 @@ class VoiceAgent:
         if lone and not is_command(text, self.language):
             self._print(f"  x  ignored lone word: {text}")
             return
-        if not is_command(text, self.language):
+        if not is_order(text, self.language):
             self._pass_on(text)  # a question or remark does not cancel a pending order
             return
         self._pending, self._pending_at, self._reasked = as_command(text), self._clock(), False
@@ -580,6 +643,11 @@ class VoiceAgent:
         self._ask(self._pending)
 
     def _ask(self, order: str) -> None:
+        if getattr(self.args, "natural_confirm", False) and self.language == "en":
+            question = natural_question(order)
+            if question:
+                self._say_self(question, own="Shall I")
+                return
         phrase = PHRASES[self.language]["confirm"]
         self._say_self(phrase.format(read_back(order, self.language)), own=phrase.format(""))
 
