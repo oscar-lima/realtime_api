@@ -475,3 +475,27 @@ def test_a_long_custom_hint_heard_back_whole_is_still_dropped_as_a_leak(rva):
     agent.args.transcription_hint = "Mobipick. affirmative, bitte, bonjour, correct, hello, nope, yeah, yup."
     assert talk(agent, "affirmative, bitte, bonjour, correct, hello, nope, yeah, yup.") == []
     assert talk(agent, "Hello") == [("pass", "Hello")]
+
+
+def test_latency_marks_print_a_local_time_to_the_millisecond(rva):
+    import re
+    agent = make_agent(rva)
+    lines = []
+    agent._print = lines.append
+    agent._on_user_text("Hello")  # passes on -> recognized_speech_sent
+    agent._on_speak("Hi there.")
+    agent._stamp("first_audio_out")
+    stamps = [line for line in lines if line.startswith("  t  ")]
+    assert [s.split()[-1] for s in stamps] == ["recognized_speech_sent", "speak_received", "first_audio_out"]
+    assert all(re.fullmatch(r"  t  \d\d:\d\d:\d\d\.\d{3} \w+", s) for s in stamps)
+
+
+def test_voice_marks_find_start_and_end_of_voice_by_our_own_level():
+    from realtime_api.voice_session import VOICE_GAP_FRAMES, VoiceMarks
+
+    marks = VoiceMarks()
+    seen = [marks.feed(-80.0, 0.0)]
+    seen += [marks.feed(-30.0, 1.0), marks.feed(-30.0, 1.01)]
+    seen += [marks.feed(-80.0, 1.02 + i / 100) for i in range(VOICE_GAP_FRAMES)]
+    assert [s for s in seen if s] == ["start", "end"]
+    assert marks.last_voice == 1.01  # the end carries the time of the last loud frame

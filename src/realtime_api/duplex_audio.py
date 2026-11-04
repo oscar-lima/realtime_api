@@ -457,6 +457,9 @@ class DuplexAudioEngine:
         self._aec_lock = threading.Lock()  # the AEC state is not thread safe
         self._started_at = time.monotonic()
         self._callbacks: List[FrameCallback] = []
+        self.on_event = None    # latency log: on_event(label, wall_time), called from the mic thread
+        self._marks: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._out_loud = False
         self.mic_watch = MicWatch()
         self._external_speaking = False
         self._running = False
@@ -549,6 +552,12 @@ class DuplexAudioEngine:
         if status:
             _LOG.debug("output status: %s", status)
         x = self.playback.pull(frames)
+        if self.on_event is not None:
+            loud = bool(x.any())
+            if loud and not self._out_loud:
+                latency = float(getattr(self._out_stream, "latency", 0.0) or 0.0)
+                self._marks.put(("playback_first_write", time.time() + latency))  # when it reaches the speaker
+            self._out_loud = loud
         if self.output_gain != 1.0:
             x = to_int16(x.astype(np.float32) * self.output_gain / 32768.0)
         outdata[:, 0] = x
@@ -573,6 +582,8 @@ class DuplexAudioEngine:
             except queue.Empty:
                 continue
             self.mic_watch.feed(block)
+            while self.on_event is not None and not self._marks.empty():
+                self.on_event(*self._marks.get_nowait())
             x16 = self._mic_resampler.process(block)
             if self.mic_gain != 1.0:
                 x16 = to_int16(x16.astype(np.float32) * self.mic_gain / 32768.0)

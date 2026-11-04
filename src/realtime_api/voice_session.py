@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
-from realtime_api.audio_utils import StreamResampler
+from realtime_api.audio_utils import StreamResampler, dbfs
 from realtime_api.duplex_audio import PROC_RATE
 from realtime_api.realtime_client import API_RATE, RealtimeClient
 
@@ -160,6 +160,37 @@ class TalkGate:
         return []
 
 
+VOICE_DB = -45.0     # a mic frame above this level counts as voice for the latency log
+VOICE_GAP_FRAMES = 70  # 10 ms frames of quiet that end a voice mark (0.7 s)
+
+
+class VoiceMarks:
+    """Start and end of voice in a stream of 10 ms frames by our own level (latency log, not used for decisions)."""
+
+    def __init__(self) -> None:
+        self.active = False
+        self._quiet = 0
+        self._last_voice = 0.0
+
+    def feed(self, level_db: float, now: float) -> "Optional[str]":
+        if level_db > VOICE_DB:
+            self._quiet = 0
+            self._last_voice = now
+            if not self.active:
+                self.active = True
+                return "start"
+        elif self.active:
+            self._quiet += 1
+            if self._quiet >= VOICE_GAP_FRAMES:
+                self.active = False
+                return "end"
+        return None
+
+    @property
+    def last_voice(self) -> float:
+        return self._last_voice
+
+
 class VoiceSession:
     """Streams cleaned mic audio up, plays the answer, handles barge-in."""
 
@@ -171,6 +202,7 @@ class VoiceSession:
         on_assistant_text: Optional[TextCallback] = None,
         on_assistant_delta: Optional[TextCallback] = None,
         on_tool_call: Optional[ToolCall] = None,
+        on_event: Optional[Callable[..., None]] = None,
         send_chunk_ms: int = 40,
         speak_only: bool = False,
         barge_in: str = "any",
@@ -191,6 +223,9 @@ class VoiceSession:
         self.on_assistant_text = on_assistant_text
         self.on_assistant_delta = on_assistant_delta
         self.on_tool_call = on_tool_call
+        self.on_event = on_event  # timing marks for the latency log: speech_stopped, transcript_done, first_audio_out
+        self._timed_item = ""
+        self._mic_marks, self._sent_marks = VoiceMarks(), VoiceMarks()
         self._up = StreamResampler(PROC_RATE, API_RATE)
         self._chunk: List[np.ndarray] = []
         self._chunk_frames = max(1, send_chunk_ms // 10)
@@ -225,14 +260,27 @@ class VoiceSession:
 
     # ------------------------------------------------------------ upstream
 
+    def _mark_voice(self, marks: "VoiceMarks", frame: np.ndarray, label: str) -> None:
+        now = time.time()
+        mark = marks.feed(dbfs(frame), now)
+        if mark == "start":
+            self.on_event(f"{label}_voice_start", now)
+        elif mark == "end":
+            # the end is known 0.7 s later; the stamp carries the time of the last loud frame
+            self.on_event(f"{label}_voice_end", marks.last_voice)
+
     def _on_mic_frame(self, frame: np.ndarray, info: Dict[str, object]) -> None:
         self.room.add(frame)
+        if self.on_event:
+            self._mark_voice(self._mic_marks, frame, "mic")  # after echo cancel, before the gate
         if self._barge_check_until:
             self._check_barge_in()
         frames = [frame] if self.talk is None else self.talk.process(frame)
         if not self.client.session_ready.is_set() or self.client.closed.is_set():
             return
         for out in frames:
+            if self.on_event:
+                self._mark_voice(self._sent_marks, out, "sent")  # what the gate lets through
             with self._lock:
                 self._chunk.append(out)
                 if len(self._chunk) < self._chunk_frames:
@@ -335,6 +383,9 @@ class VoiceSession:
 
     def _on_audio_delta(self, event: Dict[str, Any]) -> None:
         # deltas of an interrupted answer can still be in flight: drop them
+        if self.on_event and event.get("item_id") != self._timed_item and not self._muted(event):
+            self._timed_item = event.get("item_id", "")
+            self.on_event("first_audio_out", event.get("_rx"))
         if self.engine is not None and not self._muted(event):
             self.engine.play(RealtimeClient.decode_audio(event), API_RATE, event.get("item_id", ""))
 
@@ -351,11 +402,15 @@ class VoiceSession:
             self.on_assistant_text(event.get("text", ""))
 
     def _on_user_transcript(self, event: Dict[str, Any]) -> None:
+        if self.on_event:
+            self.on_event("transcript_done", event.get("_rx"))
         if self.on_user_text:
             self.on_user_text(event.get("transcript", "").strip())
 
     def _on_speech_started(self, event: Dict[str, Any]) -> None:
         """Barge-in: the person talks while the robot speaks -> stop talking (see ``BARGE_IN_MODES``)."""
+        if self.on_event:
+            self.on_event("speech_started", event.get("_rx"))
         if self.engine is None or not self.engine.is_playing() or self.barge_in == "stop":
             return
         if self.barge_in == "any":
@@ -370,6 +425,8 @@ class VoiceSession:
             self._barge_check_until = time.monotonic() + BARGE_IN_CHECK_S
 
     def _on_speech_stopped(self, event: Dict[str, Any]) -> None:
+        if self.on_event:
+            self.on_event("speech_stopped", event.get("_rx"))
         self._barge_check_until = 0.0
 
     def _check_barge_in(self) -> None:

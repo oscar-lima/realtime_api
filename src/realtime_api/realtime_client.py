@@ -265,6 +265,7 @@ class RealtimeClient:
         try:
             while True:
                 raw = self._ws.recv()
+                rx = time.time()  # arrival time, for the latency log (handlers may run later)
                 if not raw:
                     break
                 try:
@@ -272,6 +273,7 @@ class RealtimeClient:
                 except ValueError:
                     _LOG.warning("non-JSON message: %r", raw[:200])
                     continue
+                event["_rx"] = rx
                 self._dispatch(event)
         except Exception as exc:
             if not self.closed.is_set():

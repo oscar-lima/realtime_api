@@ -45,6 +45,7 @@ Examples
 """
 
 import argparse
+import datetime
 import json
 import logging
 import os
@@ -502,12 +503,13 @@ class VoiceAgent:
         self._said: "list[tuple[float, str]]" = []  # the robot's own recent words, to drop their echo
         self._played_until = 0.0  # when the robot voice last stopped
         self.language = "en"      # the language the person speaks now
+        self.engine.on_event = lambda what, when=None: self._stamp(what, when)
         self.voice = VoiceSession(
             self.client, self.engine,
             on_user_text=self._on_user_text,
             on_assistant_delta=self._on_robot_delta,
             on_assistant_text=self._on_robot_text,
-            on_tool_call=self._on_tool_call,
+            on_tool_call=self._on_tool_call, on_event=self._stamp,
             speak_only=self.bridge,
             barge_in=args.barge_in, barge_in_margin_db=args.barge_in_margin_db,
             push_to_talk=args.push_to_talk, talk_timeout_s=args.talk_timeout,
@@ -657,6 +659,7 @@ class VoiceAgent:
         # planner reads it with check_for_events() and listen() takes it as
         # an answer; the runner starts no new workflow then).
         self._print(f"  -> {'event' if self._busy else 'request'}: {text}")
+        self._stamp("recognized_speech_sent")
         self.ros.publish(self.args.goal_topic, text)
 
     def _say_self(self, text: str, own: str = "") -> None:
@@ -676,6 +679,7 @@ class VoiceAgent:
                               "(a stop or cancel, new information, or an answer to your question) and it will "
                               "react at its next step. A new order can only start after this one finishes."}
         self._print(f"  -> execute: {request}")
+        self._stamp("recognized_speech_sent")
         self.ros.publish(self.args.goal_topic, request)
         return {"status": "started; progress, results and questions will come as [I said] and [status] messages"}
 
@@ -698,6 +702,7 @@ class VoiceAgent:
         text = text.strip()
         if not text:
             return
+        self._stamp("speak_received")
         self._print(f"  <- planner says: {text}")
         if text.rstrip().endswith("?"):
             self._asked_at = self._clock()
@@ -729,6 +734,14 @@ class VoiceAgent:
             self._line_open = False
         if text:
             self.ros.publish("/realtime/robot_transcript", text)
+
+    def _stamp(self, what: str, when: "float | None" = None) -> None:
+        """Latency log: one line with the local time to the millisecond (speech_stopped, transcript_done,
+        recognized_speech_sent, speak_received, first_audio_out), to see where a reply spends its time."""
+        handled = time.time()
+        shown = datetime.datetime.fromtimestamp(when if when else handled)
+        late = f" (handled +{(handled - when) * 1000:.0f} ms later)" if when and handled - when > 0.05 else ""
+        self._print(f"  t  {shown:%H:%M:%S}.{shown.microsecond // 1000:03d} {what}{late}")
 
     def _print(self, line: str) -> None:
         if self._line_open:
