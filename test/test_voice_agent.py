@@ -33,10 +33,11 @@ def make_agent(rva, languages="en,de,es"):
     agent.voice = types.SimpleNamespace(language="English")
     agent.args = types.SimpleNamespace(no_confirm=False, goal_topic="/recognized_speech",
                                        transcription_hint="", languages=languages)
-    agent.out = []
+    agent.out, agent.published = [], []
     agent._ack_n = 0
     agent.ros = types.SimpleNamespace(
-        publish=lambda topic, text: topic == "/recognized_speech" and agent.out.append(("pass", text)))
+        publish=lambda topic, text: (agent.published.append((topic, text)),
+                                     topic == "/recognized_speech" and agent.out.append(("pass", text))))
     agent.voice.say = lambda text: agent.out.append(("say", text))
     agent.voice.interrupt = lambda reason="": agent._speaking and agent.out.append(("interrupt", reason))
     agent._print = lambda line: None
@@ -524,6 +525,36 @@ def test_latency_marks_print_a_local_time_to_the_millisecond(rva):
     stamps = [line for line in lines if line.startswith("  t  ")]
     assert [s.split()[-1] for s in stamps] == ["recognized_speech_sent", "speak_received", "first_audio_out"]
     assert all(re.fullmatch(r"  t  \d\d:\d\d:\d\d\.\d{3} \w+", s) for s in stamps)
+
+
+def test_fast_greeting_is_off_by_default_and_answers_a_bare_greeting_at_once_when_on(rva):
+    agent = make_agent(rva)
+    agent.args.ack = "always"
+    out = talk(agent, "Hi Mobipick.")  # off: to the planner, with the acknowledgement
+    assert out[0] == ("pass", "Hi Mobipick.") and out[1][1] in rva.ACK_PHRASES["en"]
+    agent.args.fast_greeting = True
+    first = rva.GREETING_REPLIES["en"][0]
+    assert talk(agent, "Hi Mobipick.") == [("say", first)]  # no planner, no acknowledgement
+    assert talk(agent, "Hello") == [("say", rva.GREETING_REPLIES["en"][1])]
+    assert talk(agent, "Mobipick.") == [("say", first)]  # the name alone, the wake word
+    assert talk(agent, "Hey, Mobipick!") == [("say", rva.GREETING_REPLIES["en"][1])]
+    assert talk(agent, "hi my pick") == [("say", first)]  # the misheard name is fixed first
+    agent.language = "es"  # set by the person's last Spanish sentence
+    assert talk(agent, "Hola Mobipick") == [("say", rva.GREETING_REPLIES["es"][1])]
+    to_planner = [text for topic, text in agent.published if topic == "/recognized_speech"]
+    assert to_planner == ["Hi Mobipick."]  # only the one from before the switch
+
+
+def test_fast_greeting_leaves_requests_running_orders_and_waiting_yes_alone(rva):
+    agent = make_agent(rva)
+    agent.args.fast_greeting = True
+    assert talk(agent, "Hi Mobipick, who built you?") == [("pass", "Hi Mobipick, who built you?")]
+    assert talk(agent, "Hi Mobipick, pick the coke") == [("say", "Hi Mobipick, pick the coke?")]
+    assert talk(agent, "Mobipick") == [("say", "Hi Mobipick, pick the coke?")]  # a yep heard as the name: asked again
+    agent._pending = ""
+    agent._busy = True
+    assert talk(agent, "Hello") == [("pass", "Hello")]  # an order runs: an event for it, as before
+    assert not rva.is_bare_greeting("") and not rva.is_bare_greeting("hello there")
 
 
 def test_voice_marks_find_start_and_end_of_voice_by_our_own_level():

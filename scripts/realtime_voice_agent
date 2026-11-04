@@ -182,6 +182,13 @@ ACK_PHRASES = {"en": ["Mm-hm, let me think.", "One moment.", "Understood."],
                "it": ["Mm-hm, ci penso.", "Un momento.", "Capito."],
                "fr": ["Mm-hm, je réfléchis.", "Un instant.", "Compris."]}
 ACK_MODES = ("off", "always", "questions")
+# Said at once to a bare greeting or the robot's name alone ("Hi Mobipick", "Hello", "Mobipick") with
+# --fast-greeting, instead of an acknowledgement plus the planner's reply about two seconds later.
+GREETING_REPLIES = {"en": ["Hello, I am Mobipick. How can I help you?", "Hi, I'm listening."],
+                    "es": ["Hola, soy Mobipick. ¿En qué puedo ayudarte?", "Hola, te escucho."],
+                    "de": ["Hallo, ich bin Mobipick. Wie kann ich helfen?", "Hallo, ich höre zu."],
+                    "it": ["Ciao, sono Mobipick. Come posso aiutarti?", "Ciao, ti ascolto."],
+                    "fr": ["Bonjour, je suis Mobipick. Comment puis-je vous aider ?", "Bonjour, je vous écoute."]}
 # An order waits for its yes until the person had CONFIRM_REPLY_S of quiet after the robot's last sentence (the
 # question, or whatever it said after it), and at most CONFIRM_MAX_S after the order; other talk keeps it waiting.
 CONFIRM_REPLY_S = 15.0
@@ -394,6 +401,12 @@ LEAD_RE = re.compile(r"^\W*((yes|yeah|ok|okay|sí|si|vale|claro|ja|genau|also|so
                      r"jetzt|und|dann)\b[\s,.!]*)+", re.I)
 
 
+def is_bare_greeting(text: str) -> bool:
+    """Nothing but greetings and the robot's name: "Hi Mobipick.", "Hello", "Hey, Mobipick!", "Mobipick"."""
+    words = words_of(text)
+    return bool(words) and all(w in GREETINGS or w == "mobipick" for w in words)
+
+
 def read_back(order: str, language: str = "en") -> str:
     """The order as the robot asks it back: from its first sentence with an action verb, without a lead-in.
 
@@ -452,6 +465,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ack", choices=ACK_MODES, default=os.environ.get("REALTIME_ACK", "off"),
                    help="say 'Mm-hm, let me think.' at once when an utterance is passed on: always, or only for "
                         "questions (quieter in a crowded room); not for an order that is read back (default off)")
+    p.add_argument("--fast-greeting", action="store_true",
+                   default=os.environ.get("REALTIME_FAST_GREETING", "0") == "1",
+                   help="answer a bare greeting or the robot's name alone ('Hi Mobipick', 'Hello', 'Mobipick') "
+                        "at once with a fixed sentence instead of passing it to the planner, which takes about "
+                        "two seconds; only while idle and with no order waiting for a yes (default off)")
     p.add_argument("--push-to-talk", action="store_true", default=os.environ.get("REALTIME_PUSH_TO_TALK", "0") == "1",
                    help="send the mic only while true is published on --talk-topic (e.g. scripts/push_to_talk), so "
                         "during a public demo only the operator is heard (default off)")
@@ -571,11 +589,29 @@ class VoiceAgent:
             self.voice.language = LANGUAGE_NAMES[language]
         if is_stop(text):
             self.voice.interrupt("stop word")  # --barge-in stop: the only way to cut the robot off
+        if self.bridge and self._greet_fast(text):
+            return
         if confirming:
             self._confirm(text)
             return
         if self.bridge or self._busy:
             self._pass_on(text)
+
+    def _greet_fast(self, text: str) -> bool:
+        """--fast-greeting: answer "Hi Mobipick" ourselves at once; the planner never sees it.
+
+        Not while an order runs (the greeting may be meant for it) or an order waits for a yes (a "yep" heard
+        as "Mobipick" must reach the yes-or-no handling).
+        """
+        if not getattr(self.args, "fast_greeting", False) or self._busy or self._pending_order():
+            return False
+        if not is_bare_greeting(text):
+            return False
+        replies = GREETING_REPLIES[self.language]
+        self._greet_n = getattr(self, "_greet_n", 0) + 1
+        self._print(f"  ~  greeting answered at once: {text}")
+        self._say_self(replies[(self._greet_n - 1) % len(replies)])
+        return True
 
     def _confirm(self, text: str) -> None:
         """Read a command back ("Pick the Pringles?") and pass it on only after a yes.

@@ -363,3 +363,8 @@ config/litellm_realtime.yaml
   me think." / "One moment." / "Understood." (rotating, in the person's language) while the agents think. Not for an
   order that is read back (that question is the reaction), not after a yes ("Okay."), not for a stop, not while the
   robot is speaking. `questions` keeps room talk silent.
+- `--fast-greeting` (env `REALTIME_FAST_GREETING=1`, GUI `voice_fast_greeting:=true`): a bare greeting or the
+  robot's name alone ("Hi Mobipick", "Hello", "Mobipick") is answered at once with a fixed sentence ("Hello, I am
+  Mobipick. How can I help you?" / "Hi, I'm listening.", in the person's language) and is not passed on: no
+  acknowledgement, no planner reply about two seconds later. Not while an order runs, not while an order waits for a
+  yes; a greeting with more words ("Hi Mobipick, who built you?") goes on as before.
